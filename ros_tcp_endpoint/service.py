@@ -12,11 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
 import re
+import threading
 
-from rclpy.serialization import serialize_message, deserialize_message
-from std_msgs.msg import Empty
+from rclpy.serialization import deserialize_message
 
 from .communication import RosSender
 
@@ -39,6 +38,7 @@ class RosService(RosSender):
         self.service_topic = service
         self.cli = self.create_client(service_class, service)
         self.req = service_class.Request()
+        self.service_wait_timeout_sec = 5.0
 
     def send(self, data):
         """
@@ -53,31 +53,42 @@ class RosService(RosSender):
             service response
         """
         message_type = type(self.req)
-        
+
         try:
             message = deserialize_message(data, message_type)
-        except:
-            message = message_type()
-        
-        data = serialize_message(message)
-
-        if not self.cli.service_is_ready():
+        except Exception as exc:  # noqa: pylint: disable=broad-except
             self.get_logger().error(
-                "Ignoring service call to {} - service is not ready.".format(self.service_topic)
+                "Ignoring service call to {} - failed to deserialize request: {}".format(
+                    self.service_topic, exc
+                )
             )
             return None
 
-        self.future = self.cli.call_async(message)
+        if not self.cli.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
+            self.get_logger().error(
+                "Ignoring service call to {} - service is not ready within {}s.".format(
+                    self.service_topic, self.service_wait_timeout_sec
+                )
+            )
+            return None
 
-        while rclpy.ok():
-            if self.future.done():
-                try:
-                    response = self.future.result()
-                    return response
-                except Exception as e:
-                    self.get_logger().info(f"Service call failed {e}")
+        future = self.cli.call_async(message)
+        done_event = threading.Event()
+        future.add_done_callback(lambda _: done_event.set())
 
-                break
+        if not done_event.wait(timeout=self.service_wait_timeout_sec):
+            self.get_logger().error(
+                "Service call to {} timed out after {}s".format(
+                    self.service_topic, self.service_wait_timeout_sec
+                )
+            )
+            return None
+
+        try:
+            response = future.result()
+            return response
+        except Exception as exc:  # noqa: pylint: disable=broad-except
+            self.get_logger().error("Service call to {} failed: {}".format(self.service_topic, exc))
 
         return None
 

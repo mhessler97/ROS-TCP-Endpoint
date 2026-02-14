@@ -39,6 +39,7 @@ class UnityActionServer(RosReceiver):
         self._goal_handles = {}
         self._result_futures = {}
         self._lock = threading.Lock()
+        self.result_timeout_sec = 10.0
 
         self.action_server = ActionServer(
             self,
@@ -120,8 +121,20 @@ class UnityActionServer(RosReceiver):
             self.action_name, goal_id, goal_handle.request
         )
 
-        result_msg = await result_future
-        return result_msg
+        try:
+            result_msg = await asyncio.wait_for(result_future, timeout=self.result_timeout_sec)
+            return result_msg
+        except asyncio.TimeoutError:
+            self.get_logger().error(
+                "Timed out waiting for Unity action result on %s for goal %s",
+                self.action_name,
+                goal_id,
+            )
+            with self._lock:
+                self._result_futures.pop(goal_id, None)
+                self._goal_handles.pop(goal_id, None)
+            goal_handle.abort()
+            return self.action_type.Result()
 
     def _ros_uuid_to_str(self, goal_id):
         return "".join(["{:02x}".format(b) for b in goal_id.uuid])

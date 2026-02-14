@@ -12,16 +12,14 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
 import struct
+import socket
+import time
 
 import threading
 import json
 
-from rclpy.serialization import deserialize_message
 from rclpy.serialization import serialize_message
-
-from .exceptions import TopicOrServiceNameDoesNotExistError
 
 
 class ClientThread(threading.Thread):
@@ -30,7 +28,7 @@ class ClientThread(threading.Thread):
     desired source.
     """
 
-    def __init__(self, conn, tcp_server, incoming_ip, incoming_port):
+    def __init__(self, conn, tcp_server, incoming_ip, incoming_port, client_id):
         """
         Set class variables
         Args:
@@ -43,6 +41,12 @@ class ClientThread(threading.Thread):
         self.tcp_server = tcp_server
         self.incoming_ip = incoming_ip
         self.incoming_port = incoming_port
+        self.client_id = client_id
+        self.pending_srv_id = None
+        self.pending_srv_is_request = False
+        self.pending_action = None
+        self.pending_payload_deadline = None
+        self.pending_payload_timeout_sec = 5.0
         threading.Thread.__init__(self)
 
     @staticmethod
@@ -54,7 +58,15 @@ class ClientThread(threading.Thread):
         view = memoryview(buffer)
         pos = 0
         while pos < size:
-            read = conn.recv_into(view[pos:], size - pos, flags)
+            try:
+                read = conn.recv_into(view[pos:], size - pos, flags)
+            except socket.timeout:
+                # If no bytes have been read yet, let the outer loop poll for
+                # pending-protocol timeouts. Once bytes are partially consumed,
+                # keep waiting to avoid corrupting frame boundaries.
+                if pos == 0:
+                    raise
+                continue
             if not read:
                 raise IOError("No more data available")
             pos += read
@@ -101,7 +113,9 @@ class ClientThread(threading.Thread):
         data = ClientThread.recvall(conn, full_message_size)
 
         if full_message_size > 0 and not data:
-            self.logerr("No data for a message size of {}, breaking!".format(full_message_size))
+            self.tcp_server.logerr(
+                "No data for a message size of {}, breaking!".format(full_message_size)
+            )
             return
 
         destination = destination.rstrip("\x00")
@@ -147,7 +161,7 @@ class ClientThread(threading.Thread):
             error_msg = "Service destination '{}' is not registered! Known services are: {} ".format(
                 destination, self.tcp_server.ros_services_table.keys()
             )
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             # TODO: send a response to Unity anyway?
             return
@@ -164,12 +178,61 @@ class ClientThread(threading.Thread):
 
         if not response:
             error_msg = "No response data from service '{}'!".format(destination)
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             # TODO: send a response to Unity anyway?
             return
 
-        self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
+        self.tcp_server.unity_tcp_sender.send_ros_service_response(
+            srv_id, destination, response, client_id=self.client_id
+        )
+
+    def set_pending_service(self, srv_id, is_request):
+        self.pending_srv_id = srv_id
+        self.pending_srv_is_request = is_request
+        self.pending_payload_deadline = time.monotonic() + self.pending_payload_timeout_sec
+
+    def set_pending_action(self, action_name, goal_id, phase, status=None):
+        self.pending_action = {
+            "action_name": action_name,
+            "goal_id": goal_id,
+            "phase": phase,
+            "status": status,
+        }
+        self.pending_payload_deadline = time.monotonic() + self.pending_payload_timeout_sec
+
+    def clear_pending_payload(self):
+        self.pending_srv_id = None
+        self.pending_srv_is_request = False
+        self.pending_action = None
+        self.pending_payload_deadline = None
+
+    def expire_pending_payload_if_needed(self):
+        deadline = self.pending_payload_deadline
+        if deadline is None:
+            return
+        if time.monotonic() < deadline:
+            return
+
+        if self.pending_srv_id is not None:
+            self.tcp_server.send_unity_error(
+                "Timed out waiting for service payload for srv_id {}".format(self.pending_srv_id),
+                client_id=self.client_id,
+            )
+            self.tcp_server.logwarn(
+                "Client {} timed out waiting for pending service payload".format(self.client_id)
+            )
+        elif self.pending_action is not None:
+            self.tcp_server.send_unity_error(
+                "Timed out waiting for action payload for '{}' goal {}".format(
+                    self.pending_action.get("action_name"), self.pending_action.get("goal_id")
+                ),
+                client_id=self.client_id,
+            )
+            self.tcp_server.logwarn(
+                "Client {} timed out waiting for pending action payload".format(self.client_id)
+            )
+        self.clear_pending_payload()
 
     def run(self):
         """
@@ -186,33 +249,43 @@ class ClientThread(threading.Thread):
             msg: the ROS msg type as bytes
 
         """
-        self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
+        self.tcp_server.loginfo(
+            "Connection from {}:{} (client_id={})".format(
+                self.incoming_ip, self.incoming_port, self.client_id
+            )
+        )
         halt_event = threading.Event()
-        self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
+        self.conn.settimeout(0.2)
+        self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event, self.client_id)
         try:
             while not halt_event.is_set():
-                destination, data = self.read_message(self.conn)
+                try:
+                    message = self.read_message(self.conn)
+                except socket.timeout:
+                    self.expire_pending_payload_if_needed()
+                    continue
+                if message is None:
+                    break
+                destination, data = message
 
                 # Process this message that was sent from Unity
-                if self.tcp_server.pending_srv_id is not None:
+                if self.pending_srv_id is not None:
                     # if we've been told that the next message will be a service request/response, process it as such
-                    if self.tcp_server.pending_srv_is_request:
-                        self.send_ros_service_request(
-                            self.tcp_server.pending_srv_id, destination, data
-                        )
+                    if self.pending_srv_is_request:
+                        self.send_ros_service_request(self.pending_srv_id, destination, data)
                     else:
                         self.tcp_server.send_unity_service_response(
-                            self.tcp_server.pending_srv_id, data
+                            self.pending_srv_id, data, client_id=self.client_id
                         )
-                    self.tcp_server.pending_srv_id = None
-                elif self.tcp_server.pending_action is not None:
+                    self.clear_pending_payload()
+                elif self.pending_action is not None:
                     self._handle_pending_action(destination, data)
                 elif destination == "":
                     # ignore this keepalive message, listen for more
                     pass
                 elif destination.startswith("__"):
                     # handle a system command, such as registering new topics
-                    self.tcp_server.handle_syscommand(destination, data)
+                    self.tcp_server.handle_syscommand(destination, data, client_thread=self)
                 elif destination in self.tcp_server.publishers_table:
                     ros_communicator = self.tcp_server.publishers_table[destination]
                     ros_communicator.send(data)
@@ -220,18 +293,23 @@ class ClientThread(threading.Thread):
                     error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
                         destination, self.tcp_server.publishers_table.keys()
                     )
-                    self.tcp_server.send_unity_error(error_msg)
+                    self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
                     self.tcp_server.logerr(error_msg)
         except IOError as e:
             self.tcp_server.logerr("Exception: {}".format(e))
         finally:
             halt_event.set()
             self.conn.close()
-            self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))
+            self.tcp_server.on_client_disconnect(self.client_id)
+            self.tcp_server.loginfo(
+                "Disconnected from {}:{} (client_id={})".format(
+                    self.incoming_ip, self.incoming_port, self.client_id
+                )
+            )
 
     def _handle_pending_action(self, destination, data):
-        action_context = self.tcp_server.pending_action
-        self.tcp_server.pending_action = None
+        action_context = self.pending_action
+        self.clear_pending_payload()
 
         if action_context is None:
             return
@@ -261,7 +339,7 @@ class ClientThread(threading.Thread):
             error_msg = "Action goal received for unregistered action '{}' (known actions: {})".format(
                 action_name, known
             )
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             return
 
@@ -271,7 +349,7 @@ class ClientThread(threading.Thread):
         action_server = self.tcp_server.unity_action_servers.get(action_name)
         if action_server is None:
             error_msg = "Action feedback received for unregistered Unity action '{}'".format(action_name)
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             return
 
@@ -281,7 +359,7 @@ class ClientThread(threading.Thread):
         action_server = self.tcp_server.unity_action_servers.get(action_name)
         if action_server is None:
             error_msg = "Action result received for unregistered Unity action '{}'".format(action_name)
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             return
 

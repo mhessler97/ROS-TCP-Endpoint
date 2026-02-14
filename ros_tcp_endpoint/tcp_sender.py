@@ -12,15 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
-import socket
-import time
 import threading
 import json
 
-from rclpy.node import Node
 from rclpy.serialization import deserialize_message
-from rclpy.serialization import serialize_message
 
 from .client import ClientThread
 from .thread_pauser import ThreadPauser
@@ -40,88 +35,150 @@ class UnityTcpSender:
     """
 
     def __init__(self, tcp_server):
-        # super().__init__(f'UnityTcpSender')
-
         self.sender_id = 1
         self.time_between_halt_checks = 5
         self.tcp_server = tcp_server
 
-        # Each sender thread has its own queue: this is always the queue for the currently active thread.
-        self.queue = None
+        # Each connected client has a dedicated outgoing queue.
+        self.client_queues = {}
         self.queue_lock = threading.Lock()
 
         # variables needed for matching up unity service requests with responses
         self.next_srv_id = 1001
         self.srv_lock = threading.Lock()
         self.services_waiting = {}
+        self.unity_service_timeout_sec = 5.0
 
-        # preview: action protocol support (goal_id -> ThreadPauser)
-        self.action_lock = threading.Lock()
-        self.actions_waiting = {}
+    def _get_queue(self, client_id):
+        with self.queue_lock:
+            return self.client_queues.get(client_id)
 
-    def send_unity_info(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__log", command)
-            self.queue.put(serialized_bytes)
+    def _enqueue(self, payload, client_id=None):
+        if client_id is not None:
+            queue = self._get_queue(client_id)
+            if queue is None:
+                return False
+            queue.put(payload)
+            return True
 
-    def send_unity_warning(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__warn", command)
-            self.queue.put(serialized_bytes)
+        with self.queue_lock:
+            queues = list(self.client_queues.values())
+        if not queues:
+            return False
+        for queue in queues:
+            queue.put(payload)
+        return True
 
-    def send_unity_error(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__error", command)
-            self.queue.put(serialized_bytes)
+    def _resolve_owner(self, owner_table, key, client_id=None):
+        if client_id is not None:
+            return client_id
+        return owner_table.get(key)
 
-    def send_ros_service_response(self, srv_id, destination, response):
-        if self.queue is not None:
-            command = SysCommand_Service()
-            command.srv_id = srv_id
-            serialized_header = ClientThread.serialize_command("__response", command)
-            serialized_message = ClientThread.serialize_message(destination, response)
-            self.queue.put(b"".join([serialized_header, serialized_message]))
+    def send_unity_info(self, text, client_id=None):
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__log", command)
+        self._enqueue(serialized_bytes, client_id=client_id)
 
-    def send_unity_message(self, topic, message):
-        if self.queue is not None:
-            serialized_message = ClientThread.serialize_message(topic, message)
-            self.queue.put(serialized_message)
+    def send_unity_warning(self, text, client_id=None):
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__warn", command)
+        self._enqueue(serialized_bytes, client_id=client_id)
+
+    def send_unity_error(self, text, client_id=None):
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__error", command)
+        self._enqueue(serialized_bytes, client_id=client_id)
+
+    def send_ros_service_response(self, srv_id, destination, response, client_id=None):
+        command = SysCommand_Service()
+        command.srv_id = srv_id
+        serialized_header = ClientThread.serialize_command("__response", command)
+        serialized_message = ClientThread.serialize_message(destination, response)
+        if not self._enqueue(b"".join([serialized_header, serialized_message]), client_id=client_id):
+            self.tcp_server.logwarn(
+                "Dropping ROS service response {} for '{}' because client queue is unavailable".format(
+                    srv_id, destination
+                )
+            )
+
+    def send_unity_message(self, topic, message, client_id=None):
+        target_client_id = self._resolve_owner(
+            self.tcp_server.subscriber_clients, topic, client_id=client_id
+        )
+        if target_client_id is None:
+            self.tcp_server.logwarn(
+                "Dropping message for topic '{}' because no client owns this subscription".format(
+                    topic
+                )
+            )
+            return
+        serialized_message = ClientThread.serialize_message(topic, message)
+        if not self._enqueue(serialized_message, client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Dropping message for topic '{}' because target client queue is unavailable".format(
+                    topic
+                )
+            )
 
     def send_action_feedback(self, topic, goal_id, feedback_msg):
-        if self.queue is None:
+        target_client_id = self._resolve_owner(self.tcp_server.ros_action_clients_owner, topic)
+        if target_client_id is None:
+            self.tcp_server.logwarn(
+                "Dropping action feedback for '{}' goal {} because no client owns this action".format(
+                    topic, goal_id
+                )
+            )
             return
-
         header = SysCommand_Action()
         header.goal_id = goal_id
         header.action_name = topic
         serialized_header = ClientThread.serialize_command("__action_feedback", header)
         serialized_message = ClientThread.serialize_message(topic, feedback_msg)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        if not self._enqueue(b"".join([serialized_header, serialized_message]), client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Dropping action feedback for '{}' goal {} because target client queue is unavailable".format(
+                    topic, goal_id
+                )
+            )
 
     def send_action_result(self, topic, goal_id, status, result_msg):
-        if self.queue is None:
+        target_client_id = self._resolve_owner(self.tcp_server.ros_action_clients_owner, topic)
+        if target_client_id is None:
+            self.tcp_server.logwarn(
+                "Dropping action result for '{}' goal {} because no client owns this action".format(
+                    topic, goal_id
+                )
+            )
             return
-
         header = SysCommand_Action()
         header.goal_id = goal_id
         header.status = status
         header.action_name = topic
         serialized_header = ClientThread.serialize_command("__action_result", header)
         serialized_message = ClientThread.serialize_message(topic, result_msg)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        if not self._enqueue(b"".join([serialized_header, serialized_message]), client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Dropping action result for '{}' goal {} because target client queue is unavailable".format(
+                    topic, goal_id
+                )
+            )
 
     def send_action_goal_response(
         self, action_name, goal_id, accepted, ros_goal_id="", message=""
     ):
-        if self.queue is None:
+        target_client_id = self._resolve_owner(
+            self.tcp_server.ros_action_clients_owner, action_name
+        )
+        if target_client_id is None:
+            self.tcp_server.logwarn(
+                "Dropping action goal response for '{}' goal {} because no client owns this action".format(
+                    action_name, goal_id
+                )
+            )
             return
-
         header = SysCommand_ActionGoalResponse()
         header.goal_id = goal_id
         header.action_name = action_name
@@ -129,12 +186,20 @@ class UnityTcpSender:
         header.ros_goal_id = ros_goal_id or ""
         header.message = message or ""
         serialized_header = ClientThread.serialize_command("__action_goal_response", header)
-        self.queue.put(serialized_header)
+        if not self._enqueue(serialized_header, client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Dropping action goal response for '{}' goal {} because target client queue is unavailable".format(
+                    action_name, goal_id
+                )
+            )
 
     def send_unity_action_goal_request(self, action_name, goal_id, goal_msg):
-        if self.queue is None:
+        target_client_id = self._resolve_owner(
+            self.tcp_server.unity_action_servers_owner, action_name
+        )
+        if target_client_id is None:
             self.tcp_server.logwarn(
-                "Cannot forward action goal {} for {} because Unity queue is unavailable".format(
+                "Cannot forward action goal {} for {} because no Unity action owner is registered".format(
                     goal_id, action_name
                 )
             )
@@ -145,12 +210,20 @@ class UnityTcpSender:
         header.action_name = action_name
         serialized_header = ClientThread.serialize_command("__action_goal_request", header)
         serialized_message = ClientThread.serialize_message(action_name, goal_msg)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        if not self._enqueue(b"".join([serialized_header, serialized_message]), client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Cannot forward action goal {} for {} because Unity queue is unavailable".format(
+                    goal_id, action_name
+                )
+            )
 
     def send_unity_action_cancel_request(self, action_name, goal_id):
-        if self.queue is None:
+        target_client_id = self._resolve_owner(
+            self.tcp_server.unity_action_servers_owner, action_name
+        )
+        if target_client_id is None:
             self.tcp_server.logwarn(
-                "Cannot forward action cancel {} for {} because Unity queue is unavailable".format(
+                "Cannot forward action cancel {} for {} because no Unity action owner is registered".format(
                     goal_id, action_name
                 )
             )
@@ -160,52 +233,117 @@ class UnityTcpSender:
         header.goal_id = goal_id
         header.action_name = action_name
         serialized_header = ClientThread.serialize_command("__action_cancel_request", header)
-        self.queue.put(serialized_header)
+        if not self._enqueue(serialized_header, client_id=target_client_id):
+            self.tcp_server.logwarn(
+                "Cannot forward action cancel {} for {} because Unity queue is unavailable".format(
+                    goal_id, action_name
+                )
+            )
 
-    def register_pending_action(self, goal_id):
-        thread_pauser = ThreadPauser()
-        with self.action_lock:
-            self.actions_waiting[goal_id] = thread_pauser
-        return thread_pauser
-
-    def resolve_pending_action(self, goal_id, data):
-        with self.action_lock:
-            thread_pauser = self.actions_waiting.get(goal_id)
-            if thread_pauser is None:
-                return
-            del self.actions_waiting[goal_id]
-        thread_pauser.resume_with_result(data)
-
-    def send_unity_service_request(self, topic, service_class, request):
-        if self.queue is None:
+    def send_unity_service_request(self, topic, service_class, request, client_id=None):
+        target_client_id = self._resolve_owner(
+            self.tcp_server.unity_service_clients, topic, client_id=client_id
+        )
+        if target_client_id is None:
+            self.tcp_server.logerr(
+                "No Unity client registered for service '{}'".format(topic)
+            )
             return None
 
         thread_pauser = ThreadPauser()
         with self.srv_lock:
             srv_id = self.next_srv_id
             self.next_srv_id += 1
-            self.services_waiting[srv_id] = thread_pauser
+            self.services_waiting[srv_id] = {
+                "pauser": thread_pauser,
+                "client_id": target_client_id,
+            }
 
         command = SysCommand_Service()
         command.srv_id = srv_id
         serialized_header = ClientThread.serialize_command("__request", command)
         serialized_message = ClientThread.serialize_message(topic, request)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        if not self._enqueue(b"".join([serialized_header, serialized_message]), client_id=target_client_id):
+            with self.srv_lock:
+                self.services_waiting.pop(srv_id, None)
+            self.tcp_server.logerr(
+                "Unable to send Unity service request {} for '{}' because target queue is unavailable".format(
+                    srv_id, topic
+                )
+            )
+            return None
 
-        # rospy starts a new thread for each service request,
-        # so it won't break anything if we sleep now while waiting for the response
-        thread_pauser.sleep_until_resumed()
+        resumed = thread_pauser.sleep_until_resumed(timeout_sec=self.unity_service_timeout_sec)
+        if not resumed:
+            with self.srv_lock:
+                self.services_waiting.pop(srv_id, None)
+            self.tcp_server.logerr(
+                "Timed out waiting for Unity service response {} for '{}'".format(srv_id, topic)
+            )
+            return None
 
-        response = deserialize_message(thread_pauser.result, service_class.Response())
-        return response
+        if thread_pauser.result is None:
+            return None
 
-    def send_unity_service_response(self, srv_id, data):
-        thread_pauser = None
+        try:
+            return deserialize_message(thread_pauser.result, service_class.Response())
+        except Exception as exc:  # noqa: pylint: disable=broad-except
+            self.tcp_server.logerr(
+                "Failed to deserialize Unity service response {} for '{}': {}".format(
+                    srv_id, topic, exc
+                )
+            )
+            return None
+
+    def send_unity_service_response(self, srv_id, data, client_id=None):
         with self.srv_lock:
-            thread_pauser = self.services_waiting[srv_id]
+            pending = self.services_waiting.get(srv_id)
+            if pending is None:
+                self.tcp_server.logwarn(
+                    "Dropping unexpected Unity service response for unknown srv_id {}".format(
+                        srv_id
+                    )
+                )
+                return
+
+            expected_client_id = pending.get("client_id")
+            if (
+                client_id is not None
+                and expected_client_id is not None
+                and expected_client_id != client_id
+            ):
+                self.tcp_server.logwarn(
+                    "Ignoring Unity service response for srv_id {} from client {} (expected client {})".format(
+                        srv_id, client_id, expected_client_id
+                    )
+                )
+                return
+
+            thread_pauser = pending.get("pauser")
             del self.services_waiting[srv_id]
 
-        thread_pauser.resume_with_result(data)
+        if thread_pauser is not None:
+            thread_pauser.resume_with_result(data)
+
+    def remove_client(self, client_id):
+        with self.queue_lock:
+            self.client_queues.pop(client_id, None)
+
+        stale_pausers = []
+        with self.srv_lock:
+            stale_srv_ids = [
+                srv_id
+                for srv_id, pending in self.services_waiting.items()
+                if pending.get("client_id") == client_id
+            ]
+            for srv_id in stale_srv_ids:
+                pending = self.services_waiting.pop(srv_id, None)
+                if pending is not None:
+                    stale_pausers.append(pending.get("pauser"))
+
+        for thread_pauser in stale_pausers:
+            if thread_pauser is not None:
+                thread_pauser.resume_with_result(None)
 
     def get_registered_topic(self, topic):
         if topic in self.tcp_server.publishers_table:
@@ -219,32 +357,39 @@ class UnityTcpSender:
         else:
             return None
 
-    def send_topic_list(self):
-        if self.queue is not None:
-            topic_list = SysCommand_TopicsResponse()
-            topics_and_types = self.tcp_server.get_topic_names_and_types()
-            topic_list.topics = [item[0] for item in topics_and_types]
-            for i in topics_and_types:
-                node = self.get_registered_topic(i[0])
-                if len(i[1]) > 1:
-                    if node is not None:
-                        self.tcp_server.get_logger().warning(
-                            "Only one message type per topic is supported, but found multiple types for topic {}; maintaining {} as the subscribed type.".format(
-                                i[0], self.parse_message_name(node.msg)
-                            )
-                        )
-                topic_list.types = [
-                    item[1][0].replace("/msg/", "/")
-                    if (len(item[1]) <= 1)
-                    else self.parse_message_name(node.msg)
-                    for item in topics_and_types
-                ]
-            serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
-            self.queue.put(serialized_bytes)
+    def send_topic_list(self, client_id=None):
+        topic_list = SysCommand_TopicsResponse()
+        topics_and_types = self.tcp_server.get_topic_names_and_types()
+        topic_list.topics = [item[0] for item in topics_and_types]
+        topic_list.types = []
 
-    def start_sender(self, conn, halt_event):
+        for topic_name, resolved_types in topics_and_types:
+            if not resolved_types:
+                topic_list.types.append("")
+                continue
+            if len(resolved_types) <= 1:
+                topic_list.types.append(resolved_types[0].replace("/msg/", "/"))
+                continue
+
+            node = self.get_registered_topic(topic_name)
+            parsed_type = self.parse_message_name(getattr(node, "msg", None))
+            if parsed_type is None:
+                parsed_type = resolved_types[0].replace("/msg/", "/")
+            topic_list.types.append(parsed_type)
+
+            if node is not None:
+                self.tcp_server.get_logger().warning(
+                    "Only one message type per topic is supported, but found multiple types for topic {}; maintaining {} as the subscribed type.".format(
+                        topic_name, parsed_type
+                    )
+                )
+
+        serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
+        self._enqueue(serialized_bytes, client_id=client_id)
+
+    def start_sender(self, conn, halt_event, client_id):
         sender_thread = threading.Thread(
-            target=self.sender_loop, args=(conn, self.sender_id, halt_event)
+            target=self.sender_loop, args=(conn, self.sender_id, halt_event, client_id)
         )
         self.sender_id += 1
 
@@ -252,8 +397,7 @@ class UnityTcpSender:
         sender_thread.daemon = True
         sender_thread.start()
 
-    def sender_loop(self, conn, tid, halt_event):
-        s = None
+    def sender_loop(self, conn, tid, halt_event, client_id):
         local_queue = Queue()
 
         # send a handshake message to confirm the connection and version number
@@ -262,7 +406,7 @@ class UnityTcpSender:
         local_queue.put(ClientThread.serialize_command("__handshake", handshake))
 
         with self.queue_lock:
-            self.queue = local_queue
+            self.client_queues[client_id] = local_queue
 
         try:
             while not halt_event.is_set():
@@ -283,10 +427,11 @@ class UnityTcpSender:
         finally:
             halt_event.set()
             with self.queue_lock:
-                if self.queue is local_queue:
-                    self.queue = None
+                queue = self.client_queues.get(client_id)
+                if queue is local_queue:
+                    del self.client_queues[client_id]
 
-    def parse_message_name(self, name):
+    def parse_message_name(self, msg_class):
         try:
             # Example input string: <class 'std_msgs.msg._string.Metaclass_String'>
             module_path = msg_class.__module__

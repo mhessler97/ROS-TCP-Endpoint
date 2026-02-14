@@ -15,16 +15,12 @@
 import rclpy
 import socket
 import json
-import sys
 import threading
-import importlib
 import time
 from json import JSONDecodeError
 
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.serialization import deserialize_message
 
 from .tcp_sender import UnityTcpSender
 from .client import ClientThread
@@ -76,16 +72,22 @@ class TcpServer(Node):
         self.unity_services_table = {}
         self.ros_action_clients = {}
         self.unity_action_servers = {}
+        self.subscriber_clients = {}
+        self.publisher_clients = {}
+        self.ros_service_clients = {}
+        self.unity_service_clients = {}
+        self.ros_action_clients_owner = {}
+        self.unity_action_servers_owner = {}
         self.buffer_size = buffer_size
         self.connections = connections
         self.syscommands = SysCommands(self)
-        self.pending_srv_id = None
-        self.pending_srv_is_request = False
-        self.pending_action = None
         self.executor = None
         self._executor_lock = threading.RLock()
         self._last_invalid_handle_log_time = 0.0
         self._last_rcl_error_log_time = 0.0
+        self._next_client_id = 1
+        self._client_id_lock = threading.Lock()
+        self._client_context = threading.local()
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -112,21 +114,37 @@ class TcpServer(Node):
 
             try:
                 (conn, (ip, port)) = tcp_server.accept()
-                ClientThread(conn, self, ip, port).start()
-            except socket.timeout as err:
+                client_id = self.allocate_client_id()
+                ClientThread(conn, self, ip, port, client_id=client_id).start()
+            except socket.timeout:
                 self.logerr("ros_tcp_endpoint.TcpServer: socket timeout")
 
-    def send_unity_error(self, error):
-        self.unity_tcp_sender.send_unity_error(error)
+    def allocate_client_id(self):
+        with self._client_id_lock:
+            client_id = self._next_client_id
+            self._next_client_id += 1
+            return client_id
 
-    def send_unity_message(self, topic, message):
-        self.unity_tcp_sender.send_unity_message(topic, message)
+    def get_active_client(self):
+        return getattr(self._client_context, "client", None)
 
-    def send_unity_service(self, topic, service_class, request):
-        return self.unity_tcp_sender.send_unity_service_request(topic, service_class, request)
+    def send_unity_error(self, error, client_id=None):
+        if client_id is None:
+            active_client = self.get_active_client()
+            if active_client is not None:
+                client_id = active_client.client_id
+        self.unity_tcp_sender.send_unity_error(error, client_id=client_id)
 
-    def send_unity_service_response(self, srv_id, data):
-        self.unity_tcp_sender.send_unity_service_response(srv_id, data)
+    def send_unity_message(self, topic, message, client_id=None):
+        self.unity_tcp_sender.send_unity_message(topic, message, client_id=client_id)
+
+    def send_unity_service(self, topic, service_class, request, client_id=None):
+        return self.unity_tcp_sender.send_unity_service_request(
+            topic, service_class, request, client_id=client_id
+        )
+
+    def send_unity_service_response(self, srv_id, data, client_id=None):
+        self.unity_tcp_sender.send_unity_service_response(srv_id, data, client_id=client_id)
 
     def cancel_ros_action_goal(self, action_name, goal_id):
         action_client = self.ros_action_clients.get(action_name)
@@ -140,10 +158,13 @@ class TcpServer(Node):
         self.loginfo("Forwarding cancel for action {} goal {}".format(action_name, goal_id))
         action_client.cancel_goal(goal_id)
 
-    def handle_syscommand(self, topic, data):
+    def handle_syscommand(self, topic, data, client_thread=None):
         function = getattr(self.syscommands, topic[2:], None)
         if function is None:
-            self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
+            self.send_unity_error(
+                "Don't understand SysCommand.'{}'".format(topic),
+                client_id=getattr(client_thread, "client_id", None),
+            )
             return
 
         # Syscommand payloads are sent as a length-prefixed UTF-8 JSON blob.
@@ -162,6 +183,10 @@ class TcpServer(Node):
                         topic, len(data), repr(message_json[:200]), exc
                     )
                 )
+                self.send_unity_error(
+                    "Invalid JSON payload for {}".format(topic),
+                    client_id=getattr(client_thread, "client_id", None),
+                )
                 return
 
         if not isinstance(params, dict):
@@ -170,9 +195,47 @@ class TcpServer(Node):
                     topic, type(params).__name__
                 )
             )
+            self.send_unity_error(
+                "Invalid syscommand payload type for {}".format(topic),
+                client_id=getattr(client_thread, "client_id", None),
+            )
             return
 
-        function(**params)
+        previous_client = getattr(self._client_context, "client", None)
+        self._client_context.client = client_thread
+        try:
+            function(**params)
+        except TypeError as exc:
+            self.logwarn(
+                "Dropping syscommand '{}' due to invalid parameters: {}".format(topic, exc)
+            )
+            self.send_unity_error(
+                "Invalid parameters for {}".format(topic),
+                client_id=getattr(client_thread, "client_id", None),
+            )
+        finally:
+            self._client_context.client = previous_client
+
+    def _unregister_owned_nodes(self, client_id, table, owner_table):
+        owned_keys = [key for key, owner in owner_table.items() if owner == client_id]
+        for key in owned_keys:
+            node = table.pop(key, None)
+            owner_table.pop(key, None)
+            if node is not None:
+                self.unregister_node(node)
+
+    def on_client_disconnect(self, client_id):
+        self.unity_tcp_sender.remove_client(client_id)
+        self._unregister_owned_nodes(client_id, self.subscribers_table, self.subscriber_clients)
+        self._unregister_owned_nodes(client_id, self.publishers_table, self.publisher_clients)
+        self._unregister_owned_nodes(client_id, self.ros_services_table, self.ros_service_clients)
+        self._unregister_owned_nodes(client_id, self.unity_services_table, self.unity_service_clients)
+        self._unregister_owned_nodes(
+            client_id, self.ros_action_clients, self.ros_action_clients_owner
+        )
+        self._unregister_owned_nodes(
+            client_id, self.unity_action_servers, self.unity_action_servers_owner
+        )
 
     def loginfo(self, text):
         self.get_logger().info(text)
@@ -301,13 +364,34 @@ class TcpServer(Node):
         self.unity_services_table.clear()
         self.ros_action_clients.clear()
         self.unity_action_servers.clear()
+        self.subscriber_clients.clear()
+        self.publisher_clients.clear()
+        self.ros_service_clients.clear()
+        self.unity_service_clients.clear()
+        self.ros_action_clients_owner.clear()
+        self.unity_action_servers_owner.clear()
 
-        self.unregister_node(self)
+        self.destroy_node()
 
 
 class SysCommands:
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
+
+    def _get_active_client(self):
+        return self.tcp_server.get_active_client()
+
+    def _get_active_client_id(self):
+        client = self._get_active_client()
+        if client is None:
+            return None
+        return client.client_id
+
+    def _set_owner(self, owner_table, key):
+        client_id = self._get_active_client_id()
+        if client_id is None:
+            return
+        owner_table[key] = client_id
 
     def _normalize_action_name(self, name: str) -> str:
         """Return a canonical action/topic name: single leading '/', no trailing '/', collapse repeats."""
@@ -337,9 +421,11 @@ class SysCommands:
         old_node = self.tcp_server.subscribers_table.get(topic)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.subscriber_clients.pop(topic, None)
 
         new_subscriber = RosSubscriber(topic, message_class, self.tcp_server)
         self.tcp_server.subscribers_table[topic] = new_subscriber
+        self._set_owner(self.tcp_server.subscriber_clients, topic)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_subscriber)
@@ -362,6 +448,7 @@ class SysCommands:
 
         self.tcp_server.unregister_node(old_node)
         del self.tcp_server.subscribers_table[topic]
+        self.tcp_server.subscriber_clients.pop(topic, None)
 
         self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
 
@@ -384,10 +471,12 @@ class SysCommands:
         old_node = self.tcp_server.publishers_table.get(topic)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.publisher_clients.pop(topic, None)
 
         new_publisher = RosPublisher(topic, message_class, queue_size=queue_size, latch=latch)
 
         self.tcp_server.publishers_table[topic] = new_publisher
+        self._set_owner(self.tcp_server.publisher_clients, topic)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_publisher)
@@ -414,10 +503,12 @@ class SysCommands:
         old_node = self.tcp_server.ros_services_table.get(topic)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.ros_service_clients.pop(topic, None)
 
         new_service = RosService(topic, message_class)
 
         self.tcp_server.ros_services_table[topic] = new_service
+        self._set_owner(self.tcp_server.ros_service_clients, topic)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_service)
@@ -445,10 +536,12 @@ class SysCommands:
         old_node = self.tcp_server.unity_services_table.get(topic)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.unity_service_clients.pop(topic, None)
 
         new_service = UnityService(str(topic), message_class, self.tcp_server)
 
         self.tcp_server.unity_services_table[topic] = new_service
+        self._set_owner(self.tcp_server.unity_service_clients, topic)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_service)
@@ -481,9 +574,11 @@ class SysCommands:
         old_node = self.tcp_server.ros_action_clients.get(action_name)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.ros_action_clients_owner.pop(action_name, None)
 
         new_client = RosActionClient(action_name, action_class, self.tcp_server)
         self.tcp_server.ros_action_clients[action_name] = new_client
+        self._set_owner(self.tcp_server.ros_action_clients_owner, action_name)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_client)
@@ -516,9 +611,11 @@ class SysCommands:
         old_node = self.tcp_server.unity_action_servers.get(action_name)
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
+            self.tcp_server.unity_action_servers_owner.pop(action_name, None)
 
         new_server = UnityActionServer(action_name, action_class, self.tcp_server)
         self.tcp_server.unity_action_servers[action_name] = new_server
+        self._set_owner(self.tcp_server.unity_action_servers_owner, action_name)
         if self.tcp_server.executor is not None:
             with self.tcp_server._executor_lock:
                 self.tcp_server.executor.add_node(new_server)
@@ -553,7 +650,8 @@ class SysCommands:
             )
         if action_name not in self.tcp_server.unity_action_servers:
             self.tcp_server.send_unity_error(
-                "Action feedback received for unknown Unity action '{}'".format(action_name)
+                "Action feedback received for unknown Unity action '{}'".format(action_name),
+                client_id=self._get_active_client_id(),
             )
             return
         self._set_pending_action(action_name, goal_id, "feedback_to_ros")
@@ -567,7 +665,8 @@ class SysCommands:
             )
         if action_name not in self.tcp_server.unity_action_servers:
             self.tcp_server.send_unity_error(
-                "Action result received for unknown Unity action '{}'".format(action_name)
+                "Action result received for unknown Unity action '{}'".format(action_name),
+                client_id=self._get_active_client_id(),
             )
             return
         self._set_pending_action(action_name, goal_id, "result_to_ros", status=status)
@@ -583,19 +682,26 @@ class SysCommands:
             self.tcp_server.cancel_ros_action_goal(action_name, goal_id)
         else:
             self.tcp_server.send_unity_error(
-                "Action cancel received for unknown ROS action '{}'".format(action_name)
+                "Action cancel received for unknown ROS action '{}'".format(action_name),
+                client_id=self._get_active_client_id(),
             )
 
     def response(self, srv_id):  # the next message is a service response
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = False
+        client = self._get_active_client()
+        if client is None:
+            self.tcp_server.logwarn("Ignoring __response without an active client context")
+            return
+        client.set_pending_service(srv_id, is_request=False)
 
     def request(self, srv_id):  # the next message is a service request
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = True
+        client = self._get_active_client()
+        if client is None:
+            self.tcp_server.logwarn("Ignoring __request without an active client context")
+            return
+        client.set_pending_service(srv_id, is_request=True)
 
     def topic_list(self):
-        self.tcp_server.unity_tcp_sender.send_topic_list()
+        self.tcp_server.unity_tcp_sender.send_topic_list(client_id=self._get_active_client_id())
 
     def resolve_message_name(self, name, extension_hint=None):
         import importlib
@@ -665,9 +771,8 @@ class SysCommands:
 
 
     def _set_pending_action(self, action_name, goal_id, phase, status=None):
-        self.tcp_server.pending_action = {
-            "action_name": action_name,
-            "goal_id": goal_id,
-            "phase": phase,
-            "status": status,
-        }
+        client = self._get_active_client()
+        if client is None:
+            self.tcp_server.logwarn("Ignoring pending action without an active client context")
+            return
+        client.set_pending_action(action_name, goal_id, phase, status=status)
