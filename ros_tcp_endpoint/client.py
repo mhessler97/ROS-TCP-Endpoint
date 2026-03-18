@@ -157,7 +157,7 @@ class ClientThread(threading.Thread):
         return cmd_info + json_info
 
     def send_ros_service_request(self, srv_id, destination, data):
-        if destination not in self.tcp_server.ros_services_table.keys():
+        if destination not in self.tcp_server.ros_services_table:
             error_msg = "Service destination '{}' is not registered! Known services are: {} ".format(
                 destination, self.tcp_server.ros_services_table.keys()
             )
@@ -167,11 +167,12 @@ class ClientThread(threading.Thread):
             return
         else:
             ros_communicator = self.tcp_server.ros_services_table[destination]
-            service_thread = threading.Thread(
-                target=self.service_call_thread, args=(srv_id, destination, data, ros_communicator)
-            )
-            service_thread.daemon = True
-            service_thread.start()
+            if not self.tcp_server.submit_service_call(
+                self.service_call_thread, srv_id, destination, data, ros_communicator
+            ):
+                error_msg = "Unable to schedule service call '{}'".format(destination)
+                self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
+                self.tcp_server.logerr(error_msg)
 
     def service_call_thread(self, srv_id, destination, data, ros_communicator):
         response = ros_communicator.send(data)

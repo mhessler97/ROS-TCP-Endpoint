@@ -17,6 +17,8 @@ import socket
 import json
 import threading
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
 
 from rclpy.node import Node
@@ -88,6 +90,10 @@ class TcpServer(Node):
         self._next_client_id = 1
         self._client_id_lock = threading.Lock()
         self._client_context = threading.local()
+        self._service_call_executor = ThreadPoolExecutor(
+            max_workers=max(4, min(8, os.cpu_count() or 4)),
+            thread_name_prefix="ros_tcp_service",
+        )
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -145,6 +151,22 @@ class TcpServer(Node):
 
     def send_unity_service_response(self, srv_id, data, client_id=None):
         self.unity_tcp_sender.send_unity_service_response(srv_id, data, client_id=client_id)
+
+    def submit_service_call(self, callback, *args):
+        try:
+            future = self._service_call_executor.submit(callback, *args)
+        except RuntimeError as exc:
+            self.logerr("Unable to schedule service call task: {}".format(exc))
+            return False
+
+        future.add_done_callback(self._handle_service_call_result)
+        return True
+
+    def _handle_service_call_result(self, future):
+        try:
+            future.result()
+        except Exception as exc:  # noqa: pylint: disable=broad-except
+            self.logerr("Unhandled exception in background service task: {}".format(exc))
 
     def cancel_ros_action_goal(self, action_name, goal_id):
         action_client = self.ros_action_clients.get(action_name)
@@ -370,6 +392,7 @@ class TcpServer(Node):
         self.unity_service_clients.clear()
         self.ros_action_clients_owner.clear()
         self.unity_action_servers_owner.clear()
+        self._service_call_executor.shutdown(wait=False)
 
         self.destroy_node()
 

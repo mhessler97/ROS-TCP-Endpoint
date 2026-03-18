@@ -14,6 +14,7 @@
 
 import re
 import threading
+import time
 
 from rclpy.serialization import deserialize_message
 
@@ -39,6 +40,14 @@ class RosService(RosSender):
         self.cli = self.create_client(service_class, service)
         self.req = service_class.Request()
         self.service_wait_timeout_sec = 5.0
+        self._last_not_ready_log_time = 0.0
+
+        if not self.cli.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
+            self.get_logger().warning(
+                "Service {} is not ready within {}s during registration; calls will fail fast until it appears.".format(
+                    self.service_topic, self.service_wait_timeout_sec
+                )
+            )
 
     @staticmethod
     def _request_is_effectively_empty(request_type):
@@ -84,12 +93,15 @@ class RosService(RosSender):
                 )
                 return None
 
-        if not self.cli.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
-            self.get_logger().error(
-                "Ignoring service call to {} - service is not ready within {}s.".format(
-                    self.service_topic, self.service_wait_timeout_sec
+        if not self.cli.service_is_ready():
+            now = time.monotonic()
+            if now - self._last_not_ready_log_time > 5.0:
+                self._last_not_ready_log_time = now
+                self.get_logger().error(
+                    "Ignoring service call to {} - service is not ready.".format(
+                        self.service_topic
+                    )
                 )
-            )
             return None
 
         future = self.cli.call_async(message)
