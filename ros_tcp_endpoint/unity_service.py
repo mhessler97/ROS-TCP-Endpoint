@@ -54,7 +54,17 @@ class UnityService(RosReceiver):
         Returns:
             The response message
         """
-        return self.tcp_server.send_unity_service(self.topic, self.service_class, request)
+        unity_response = self.tcp_server.send_unity_service(
+            self.topic, self.service_class, request
+        )
+        if unity_response is None:
+            self.get_logger().error(
+                "Unity service '{}' did not return a valid response; returning the default ROS response.".format(
+                    self.topic
+                )
+            )
+            return response
+        return unity_response
 
     def unregister(self):
         """
