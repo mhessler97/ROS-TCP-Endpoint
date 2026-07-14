@@ -27,14 +27,39 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.serialization import deserialize_message, serialize_message
+from std_msgs.msg import Empty as EmptyMessage
 from std_msgs.msg import String
 from std_srvs.srv import Empty, SetBool
+from twist_mux_msgs.action import JoyPriority, JoyTurbo
 
 from ros_tcp_endpoint import TcpServer
 
 
 HOST = "127.0.0.1"
 PORT = 12000
+CDR_REPRESENTATION_IDENTIFIERS = (
+    0x0000,
+    0x0001,
+    0x0002,
+    0x0003,
+    0x0006,
+    0x0007,
+    0x0008,
+    0x0009,
+    0x000A,
+    0x000B,
+)
+
+
+def empty_wire_encodings(message):
+    return (
+        b"",
+        serialize_message(message),
+        *(
+            identifier.to_bytes(2, byteorder="big") + b"\x00\x00"
+            for identifier in CDR_REPRESENTATION_IDENTIFIERS
+        ),
+    )
 
 
 def frame(destination, payload=b""):
@@ -190,6 +215,8 @@ def main():
     set_bool_calls = []
     slow_service_started = threading.Event()
     release_slow_service = threading.Event()
+    shutdown_action_started = threading.Event()
+    release_shutdown_action = threading.Event()
     ros_node.create_service(
         Empty,
         "/empty_ros",
@@ -252,6 +279,36 @@ def main():
         callback_group=callback_group,
     )
 
+    def execute_shutdown_action(goal_handle):
+        shutdown_action_started.set()
+        release_shutdown_action.wait(timeout=10)
+        try:
+            goal_handle.abort()
+        except Exception:
+            pass
+        return Fibonacci.Result()
+
+    shutdown_ros_action_server = ActionServer(
+        ros_node,
+        Fibonacci,
+        "/shutdown_ros_action",
+        execute_callback=execute_shutdown_action,
+        callback_group=callback_group,
+    )
+
+    def execute_empty_action(goal_handle):
+        goal_handle.publish_feedback(JoyPriority.Feedback())
+        goal_handle.succeed()
+        return JoyPriority.Result()
+
+    empty_ros_action_server = ActionServer(
+        ros_node,
+        JoyPriority,
+        "/empty_ros_action",
+        execute_callback=execute_empty_action,
+        callback_group=callback_group,
+    )
+
     wait_until(
         lambda: endpoint_thread.is_alive(), timeout=5, message="endpoint executor thread"
     )
@@ -301,6 +358,44 @@ def main():
         client2.expect_error("Not registered to publish")
         assert not from_unity_event.wait(0.3)
 
+        print("[stress] testing fieldless Unity-to-ROS topic encodings")
+        empty_topic_messages = []
+        empty_topic_event = threading.Event()
+
+        def on_empty_topic(message):
+            empty_topic_messages.append(message)
+            empty_topic_event.set()
+
+        ros_node.create_subscription(
+            EmptyMessage,
+            "/empty_from_unity",
+            on_empty_topic,
+            10,
+            callback_group=callback_group,
+        )
+        client1.send_command(
+            "__publish",
+            {"topic": "/empty_from_unity", "message_name": "std_msgs/Empty"},
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.publisher_clients, "/empty_from_unity", 2
+            ),
+            message="fieldless topic publisher registration",
+        )
+        empty_topic_encodings = empty_wire_encodings(EmptyMessage())
+        for empty_payload in empty_topic_encodings:
+            empty_topic_event.clear()
+            client1.send_message("/empty_from_unity", empty_payload)
+            assert empty_topic_event.wait(5)
+        assert len(empty_topic_messages) == len(empty_topic_encodings)
+        empty_topic_event.clear()
+        client1.send_message("/empty_from_unity", b"malformed-empty-topic")
+        assert not empty_topic_event.wait(0.3)
+        client1.send_message("/empty_from_unity", b"\x00\x01\x00\x00")
+        assert empty_topic_event.wait(5)
+        assert len(empty_topic_messages) == len(empty_topic_encodings) + 1
+
         print("[stress] testing ROS-to-Unity subscription and collision rejection")
         to_unity_publisher = ros_node.create_publisher(String, "/to_unity", 10)
         client1.send_command(
@@ -328,9 +423,9 @@ def main():
             lambda: endpoint.client_owns(endpoint.ros_service_clients, "/empty_ros", 2),
             message="empty ROS service registration",
         )
-        for srv_id, request_payload in (
-            (501, b""),
-            (504, serialize_message(Empty.Request())),
+        empty_request_encodings = empty_wire_encodings(Empty.Request())
+        for srv_id, request_payload in enumerate(
+            empty_request_encodings, start=5000
         ):
             client1.send_command("__request", {"srv_id": srv_id})
             client1.send_message("/empty_ros", request_payload)
@@ -342,7 +437,7 @@ def main():
             assert isinstance(
                 deserialize_message(empty_response, Empty.Response), Empty.Response
             )
-        assert len(empty_calls) == 2
+        assert len(empty_calls) == len(empty_request_encodings)
 
         client1.send_command(
             "__ros_service",
@@ -359,6 +454,10 @@ def main():
         assert json.loads(client1.receive("__response").decode("utf-8"))["srv_id"] == 502
         set_bool_response = deserialize_message(client1.receive("/set_bool_ros"), SetBool.Response)
         assert set_bool_response.success and set_bool_response.message == "accepted"
+        assert set_bool_calls == [True]
+        client1.send_command("__request", {"srv_id": 508})
+        client1.send_message("/set_bool_ros", b"\x00\x01\x00\x00")
+        client1.expect_error("No response data from service", timeout=5)
         assert set_bool_calls == [True]
 
         print("[stress] testing ROS service timeout during server shutdown")
@@ -407,7 +506,7 @@ def main():
             Empty, "/empty_unity", callback_group=callback_group
         )
         assert unity_service_client.wait_for_service(timeout_sec=5)
-        for response_payload in (b"", serialize_message(Empty.Response())):
+        for response_payload in empty_wire_encodings(Empty.Response()):
             service_future = unity_service_client.call_async(Empty.Request())
             request_header = json.loads(client1.receive("__request").decode("utf-8"))
             client1.receive("/empty_unity")
@@ -525,6 +624,129 @@ def main():
             break
         assert canceled_header["status"] == GoalStatus.STATUS_CANCELED
 
+        print("[stress] testing ROS action server shutdown during an accepted goal")
+        client1.send_command(
+            "__ros_action",
+            {
+                "action_name": "/shutdown_ros_action",
+                "action_type": "example_interfaces/Fibonacci",
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.ros_action_clients_owner, "/shutdown_ros_action", 2
+            ),
+            timeout=15,
+            message="shutdown ROS action registration",
+        )
+        shutdown_bridge = endpoint.get_registration(
+            endpoint.ros_action_clients, "/shutdown_ros_action"
+        )
+        client1.send_command(
+            "__action_goal",
+            {
+                "action_name": "/shutdown_ros_action",
+                "goal_id": "goal-server-shutdown",
+            },
+        )
+        client1.send_message(
+            "/shutdown_ros_action", serialize_message(Fibonacci.Goal(order=10))
+        )
+        shutdown_goal_response = json.loads(
+            client1.receive("__action_goal_response", timeout=10).decode("utf-8")
+        )
+        assert shutdown_goal_response["accepted"]
+        assert shutdown_action_started.wait(5)
+        shutdown_ros_action_server.destroy()
+        shutdown_ros_action_server = None
+        wait_until(
+            lambda: not shutdown_bridge._client.server_is_ready(),
+            timeout=10,
+            message="ROS action server shutdown discovery",
+        )
+        shutdown_result_header = json.loads(
+            client1.receive("__action_result", timeout=10).decode("utf-8")
+        )
+        shutdown_result = deserialize_message(
+            client1.receive("/shutdown_ros_action", timeout=10), Fibonacci.Result
+        )
+        assert shutdown_result_header["status"] == GoalStatus.STATUS_ABORTED
+        assert isinstance(shutdown_result, Fibonacci.Result)
+        client1.expect_error("shut down while waiting", timeout=10)
+        release_shutdown_action.set()
+
+        client1.send_command(
+            "__action_goal",
+            {
+                "action_name": "/shutdown_ros_action",
+                "goal_id": "goal-after-server-shutdown",
+            },
+        )
+        client1.send_message(
+            "/shutdown_ros_action", serialize_message(Fibonacci.Goal(order=3))
+        )
+        unavailable_goal_response = json.loads(
+            client1.receive("__action_goal_response", timeout=10).decode("utf-8")
+        )
+        assert not unavailable_goal_response["accepted"]
+        client1.expect_error("is not ready", timeout=10)
+
+        print("[stress] testing fieldless Unity-to-ROS action goals")
+        client1.send_command(
+            "__ros_action",
+            {
+                "action_name": "/empty_ros_action",
+                "action_type": "twist_mux_msgs/JoyPriority",
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.ros_action_clients_owner, "/empty_ros_action", 2
+            ),
+            timeout=15,
+            message="fieldless ROS action registration",
+        )
+        client1.send_command(
+            "__action_goal",
+            {"action_name": "/empty_ros_action", "goal_id": "malformed-empty-goal"},
+        )
+        client1.send_message("/empty_ros_action", b"malformed-empty-goal")
+        malformed_goal_response = json.loads(
+            client1.receive("__action_goal_response", timeout=10).decode("utf-8")
+        )
+        assert not malformed_goal_response["accepted"]
+        client1.expect_error("Failed to deserialize goal")
+        for index, empty_payload in enumerate(
+            empty_wire_encodings(JoyPriority.Goal())
+        ):
+            goal_id = "empty-goal-{}".format(index)
+            client1.send_command(
+                "__action_goal",
+                {"action_name": "/empty_ros_action", "goal_id": goal_id},
+            )
+            client1.send_message("/empty_ros_action", empty_payload)
+            empty_goal_response = json.loads(
+                client1.receive("__action_goal_response", timeout=10).decode("utf-8")
+            )
+            assert empty_goal_response["accepted"]
+            client1.receive("__action_feedback", timeout=10)
+            assert isinstance(
+                deserialize_message(
+                    client1.receive("/empty_ros_action"), JoyPriority.Feedback
+                ),
+                JoyPriority.Feedback,
+            )
+            empty_result_header = json.loads(
+                client1.receive("__action_result", timeout=10).decode("utf-8")
+            )
+            assert empty_result_header["status"] == GoalStatus.STATUS_SUCCEEDED
+            assert isinstance(
+                deserialize_message(
+                    client1.receive("/empty_ros_action"), JoyPriority.Result
+                ),
+                JoyPriority.Result,
+            )
+
         print("[stress] testing ROS-to-Unity action execution over TCP")
         client1.send_command(
             "__unity_action",
@@ -611,6 +833,101 @@ def main():
             cancel_from_ros_goal.get_result_async(), timeout=10
         )
         assert canceled_from_ros_result.status == GoalStatus.STATUS_CANCELED
+
+        print("[stress] testing fieldless Unity action feedback and results")
+        client1.send_command(
+            "__unity_action",
+            {
+                "action_name": "/empty_unity_action",
+                "action_type": "twist_mux_msgs/JoyTurbo",
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.unity_action_servers_owner, "/empty_unity_action", 2
+            ),
+            message="fieldless Unity action registration",
+        )
+        empty_unity_action_client = ActionClient(
+            ros_node,
+            JoyTurbo,
+            "/empty_unity_action",
+            callback_group=callback_group,
+        )
+        assert empty_unity_action_client.wait_for_server(timeout_sec=5)
+        empty_feedback_messages = []
+        for index, empty_payload in enumerate(
+            empty_wire_encodings(JoyTurbo.Result())
+        ):
+            feedback_count = len(empty_feedback_messages)
+            empty_goal_handle = wait_future(
+                empty_unity_action_client.send_goal_async(
+                    JoyTurbo.Goal(),
+                    feedback_callback=lambda message: empty_feedback_messages.append(
+                        message.feedback
+                    ),
+                ),
+                timeout=10,
+            )
+            assert empty_goal_handle.accepted
+            empty_goal_header = json.loads(
+                client1.receive("__action_goal_request", timeout=10).decode("utf-8")
+            )
+            assert isinstance(
+                deserialize_message(
+                    client1.receive("/empty_unity_action"), JoyTurbo.Goal
+                ),
+                JoyTurbo.Goal,
+            )
+            empty_goal_id = empty_goal_header["goal_id"]
+            client1.send_command(
+                "__action_feedback",
+                {
+                    "action_name": "/empty_unity_action",
+                    "goal_id": empty_goal_id,
+                },
+            )
+            client1.send_message("/empty_unity_action", empty_payload)
+            wait_until(
+                lambda: len(empty_feedback_messages) > feedback_count,
+                message="fieldless action feedback delivery",
+            )
+            client1.send_command(
+                "__action_result",
+                {
+                    "action_name": "/empty_unity_action",
+                    "goal_id": empty_goal_id,
+                    "status": GoalStatus.STATUS_SUCCEEDED,
+                },
+            )
+            client1.send_message("/empty_unity_action", empty_payload)
+            empty_action_result = wait_future(
+                empty_goal_handle.get_result_async(), timeout=10
+            )
+            assert empty_action_result.status == GoalStatus.STATUS_SUCCEEDED
+            assert isinstance(empty_action_result.result, JoyTurbo.Result)
+
+        malformed_result_goal = wait_future(
+            empty_unity_action_client.send_goal_async(JoyTurbo.Goal()), timeout=10
+        )
+        assert malformed_result_goal.accepted
+        malformed_result_header = json.loads(
+            client1.receive("__action_goal_request", timeout=10).decode("utf-8")
+        )
+        client1.receive("/empty_unity_action", timeout=10)
+        client1.send_command(
+            "__action_result",
+            {
+                "action_name": "/empty_unity_action",
+                "goal_id": malformed_result_header["goal_id"],
+                "status": GoalStatus.STATUS_SUCCEEDED,
+            },
+        )
+        client1.send_message("/empty_unity_action", b"malformed-empty-result")
+        malformed_action_result = wait_future(
+            malformed_result_goal.get_result_async(), timeout=10
+        )
+        assert malformed_action_result.status == GoalStatus.STATUS_ABORTED
 
         print(
             "[stress] testing disconnect cleanup, pending service/action release, "
@@ -710,6 +1027,10 @@ def main():
         client1.close()
         client2.close()
         ros_action_server.destroy()
+        if shutdown_ros_action_server is not None:
+            shutdown_ros_action_server.destroy()
+        release_shutdown_action.set()
+        empty_ros_action_server.destroy()
         rclpy.shutdown()
         endpoint_thread.join(timeout=3)
         ros_thread.join(timeout=3)

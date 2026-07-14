@@ -24,9 +24,14 @@ from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.serialization import serialize_message
 from rclpy.task import Future
+from std_msgs.msg import Empty as EmptyMessage
 from std_srvs.srv import Empty, SetBool
 
-from ros_tcp_endpoint.communication import deserialize_service_message
+from ros_tcp_endpoint.communication import (
+    deserialize_ros_message,
+    deserialize_service_message,
+    payload_is_effectively_empty,
+)
 from ros_tcp_endpoint.service import RosService
 from ros_tcp_endpoint.server import SysCommands
 from ros_tcp_endpoint.tcp_sender import UnityTcpSender
@@ -101,8 +106,13 @@ def run_rclpy_coroutine(coroutine, timeout_sec=2.0):
 
 
 def test_empty_service_request_and_response_types_accept_empty_payloads():
-    assert isinstance(deserialize_service_message(b"", Empty.Request), Empty.Request)
-    assert isinstance(deserialize_service_message(b"", Empty.Response), Empty.Response)
+    for payload in (b"", b"\x00\x01\x00\x00"):
+        assert isinstance(
+            deserialize_service_message(payload, Empty.Request), Empty.Request
+        )
+        assert isinstance(
+            deserialize_service_message(payload, Empty.Response), Empty.Response
+        )
 
     request = Empty.Request()
     response = Empty.Response()
@@ -111,6 +121,47 @@ def test_empty_service_request_and_response_types_accept_empty_payloads():
     )
     assert isinstance(
         deserialize_service_message(serialize_message(response), Empty.Response), Empty.Response
+    )
+
+
+@pytest.mark.parametrize(
+    "representation_identifier",
+    [0x0000, 0x0001, 0x0002, 0x0003, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A, 0x000B],
+)
+def test_all_header_only_cdr_encodings_are_accepted_for_fieldless_messages(
+    representation_identifier,
+):
+    payload = representation_identifier.to_bytes(2, byteorder="big") + b"\x00\x00"
+    assert payload_is_effectively_empty(payload)
+    assert isinstance(deserialize_ros_message(payload, EmptyMessage), EmptyMessage)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"\x00", b"\x00\x01", b"\x00\x01\x00", b"random"],
+)
+def test_truncated_or_invalid_empty_message_encodings_are_rejected(payload):
+    assert not payload_is_effectively_empty(payload)
+    with pytest.raises(Exception):
+        deserialize_ros_message(payload, EmptyMessage)
+
+
+def test_header_only_cdr_is_rejected_for_nonempty_message_types():
+    with pytest.raises(Exception):
+        deserialize_ros_message(b"\x00\x01\x00\x00", SetBool.Request)
+
+
+def test_installed_fieldless_action_sections_accept_header_only_cdr():
+    twist_mux_actions = pytest.importorskip("twist_mux_msgs.action")
+    action_type = twist_mux_actions.JoyPriority
+    payload = b"\x00\x01\x00\x00"
+
+    assert isinstance(deserialize_ros_message(payload, action_type.Goal), action_type.Goal)
+    assert isinstance(
+        deserialize_ros_message(payload, action_type.Result), action_type.Result
+    )
+    assert isinstance(
+        deserialize_ros_message(payload, action_type.Feedback), action_type.Feedback
     )
 
 

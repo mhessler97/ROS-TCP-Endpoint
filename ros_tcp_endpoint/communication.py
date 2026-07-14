@@ -30,14 +30,47 @@ def message_type_is_effectively_empty(message_type):
     return set(field_map.keys()) <= {"structure_needs_at_least_one_member"}
 
 
-def deserialize_service_message(data, message_type):
-    """Deserialize a service message, accepting empty payloads for empty types."""
+def payload_is_effectively_empty(data):
+    """Recognize zero-byte and header-only CDR encodings of empty messages."""
+    if not data:
+        return True
+
+    # Some ROS 2 serializers emit only the four-byte CDR encapsulation header
+    # for a fieldless message, while Fast DDS expects the generated padding
+    # member as well.  Accept the standard CDR/XCDR representation identifiers
+    # with zero encapsulation options, but do not treat arbitrary bytes as empty.
+    if len(data) != 4 or data[2:] != b"\x00\x00":
+        return False
+    representation_identifier = int.from_bytes(data[:2], byteorder="big")
+    return representation_identifier in {
+        0x0000,
+        0x0001,
+        0x0002,
+        0x0003,
+        0x0006,
+        0x0007,
+        0x0008,
+        0x0009,
+        0x000A,
+        0x000B,
+    }
+
+
+def deserialize_ros_message(data, message_type):
+    """Deserialize a ROS message, accepting empty encodings for fieldless types."""
     try:
         return deserialize_message(data, message_type)
     except Exception:
-        if not data and message_type_is_effectively_empty(message_type):
+        if (
+            payload_is_effectively_empty(data)
+            and message_type_is_effectively_empty(message_type)
+        ):
             return message_type()
         raise
+
+
+# Retain the service-specific name for downstream users of the initial fix.
+deserialize_service_message = deserialize_ros_message
 
 
 class RosSender(Node):

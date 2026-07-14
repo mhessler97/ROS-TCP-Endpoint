@@ -20,10 +20,9 @@ import time
 
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.serialization import deserialize_message
 from rclpy.task import Future
 
-from .communication import RosReceiver
+from .communication import RosReceiver, deserialize_ros_message
 
 
 class UnityActionServer(RosReceiver):
@@ -127,7 +126,9 @@ class UnityActionServer(RosReceiver):
             return
 
         try:
-            feedback_msg = deserialize_message(serialized_feedback, self.action_type.Feedback)
+            feedback_msg = deserialize_ros_message(
+                serialized_feedback, self.action_type.Feedback
+            )
             goal_handle.publish_feedback(feedback_msg)
         except Exception as exc:  # noqa: pylint: disable=broad-except
             self.get_logger().error(
@@ -138,7 +139,9 @@ class UnityActionServer(RosReceiver):
 
     def handle_unity_result(self, goal_id, status, serialized_result):
         try:
-            result_msg = deserialize_message(serialized_result, self.action_type.Result)
+            result_msg = deserialize_ros_message(
+                serialized_result, self.action_type.Result
+            )
         except Exception as exc:  # noqa: pylint: disable=broad-except
             if not self._fail_goal(goal_id, exc):
                 self.get_logger().warning(

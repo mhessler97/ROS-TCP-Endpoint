@@ -65,8 +65,12 @@ class RosService(RosSender):
             message = deserialize_service_message(data, message_type)
         except Exception as exc:  # noqa: pylint: disable=broad-except
             self.get_logger().error(
-                "Ignoring service call to {} - failed to deserialize request: {}".format(
-                    self.service_topic, exc
+                "Ignoring service call to {} - failed to deserialize request "
+                "(payload_len={}, prefix={}): {}".format(
+                    self.service_topic,
+                    len(data),
+                    bytes(data[:16]).hex(),
+                    exc,
                 )
             )
             return None

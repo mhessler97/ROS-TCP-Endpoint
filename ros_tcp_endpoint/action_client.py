@@ -19,11 +19,10 @@ import threading
 from functools import partial
 
 from rclpy.action import ActionClient
-from rclpy.serialization import deserialize_message
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
 
-from .communication import RosSender
+from .communication import RosSender, deserialize_ros_message
 
 
 class RosActionClient(RosSender):
@@ -38,9 +37,11 @@ class RosActionClient(RosSender):
         self.action_type = action_type
         self.tcp_server = tcp_server
         self._client = ActionClient(self, action_type, action_name)
+        self._inflight_goals = {}
         self._pending_goals = {}
         self._ros_goal_lookup = {}
         self._lock = threading.Lock()
+        self._server_health_timer = self.create_timer(0.1, self._check_server_health)
 
         # Ensure the ROS action server is discoverable before Unity sends goals.
         if not self._client.wait_for_server(timeout_sec=5.0):
@@ -55,23 +56,58 @@ class RosActionClient(RosSender):
     def send_goal(self, goal_uuid, serialized_goal, client_id=None):
         """Deserialize Unity payload and dispatch ROS action goal."""
         if not self._client.server_is_ready():
-            self._emit_unity_error(
-                f"Action server '{self.action_name}' is not ready; ignoring goal {goal_uuid}",
+            message = (
+                f"Action server '{self.action_name}' is not ready; ignoring goal {goal_uuid}"
+            )
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name,
+                goal_uuid,
+                False,
+                message=message,
                 client_id=client_id,
             )
+            self._emit_unity_error(message, client_id=client_id)
             return
 
         try:
-            goal_msg = deserialize_message(serialized_goal, self.action_type.Goal)
+            goal_msg = deserialize_ros_message(serialized_goal, self.action_type.Goal)
         except Exception as exc:  # noqa: pylint: disable=broad-except
-            self._emit_unity_error(
-                f"Failed to deserialize goal {goal_uuid} for '{self.action_name}': {exc}",
+            message = (
+                f"Failed to deserialize goal {goal_uuid} for '{self.action_name}' "
+                f"(payload_len={len(serialized_goal)}, "
+                f"prefix={bytes(serialized_goal[:16]).hex()}): {exc}"
+            )
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name,
+                goal_uuid,
+                False,
+                message=message,
                 client_id=client_id,
             )
+            self._emit_unity_error(message, client_id=client_id)
             return
-        goal_future = self._client.send_goal_async(
-            goal_msg, feedback_callback=self._make_feedback_callback(goal_uuid, client_id)
-        )
+        with self._lock:
+            self._inflight_goals[goal_uuid] = client_id
+        try:
+            goal_future = self._client.send_goal_async(
+                goal_msg,
+                feedback_callback=self._make_feedback_callback(goal_uuid, client_id),
+            )
+        except Exception as exc:  # noqa: pylint: disable=broad-except
+            with self._lock:
+                self._inflight_goals.pop(goal_uuid, None)
+            message = (
+                f"Failed to send goal {goal_uuid} to '{self.action_name}': {exc}"
+            )
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name,
+                goal_uuid,
+                False,
+                message=message,
+                client_id=client_id,
+            )
+            self._emit_unity_error(message, client_id=client_id)
+            return
         goal_future.add_done_callback(partial(self._on_goal_response, goal_uuid, client_id))
 
     def cancel_goal(self, goal_uuid, client_id=None):
@@ -124,6 +160,10 @@ class RosActionClient(RosSender):
         try:
             goal_handle = future.result()
         except Exception as exc:  # noqa pylint: disable=broad-except
+            with self._lock:
+                if unity_goal_id not in self._inflight_goals:
+                    return
+                self._inflight_goals.pop(unity_goal_id)
             self.tcp_server.unity_tcp_sender.send_action_goal_response(
                 self.action_name,
                 unity_goal_id,
@@ -138,6 +178,10 @@ class RosActionClient(RosSender):
             return
 
         if not goal_handle.accepted:
+            with self._lock:
+                if unity_goal_id not in self._inflight_goals:
+                    return
+                self._inflight_goals.pop(unity_goal_id)
             self.tcp_server.unity_tcp_sender.send_action_goal_response(
                 self.action_name,
                 unity_goal_id,
@@ -153,19 +197,24 @@ class RosActionClient(RosSender):
 
         ros_goal_id = self._ros_uuid_to_str(goal_handle.goal_id)
         with self._lock:
+            if unity_goal_id not in self._inflight_goals:
+                # The action server health check already rejected this goal.
+                return
+            self._inflight_goals.pop(unity_goal_id)
             self._pending_goals[unity_goal_id] = {
                 "handle": goal_handle,
                 "ros_goal_id": ros_goal_id,
                 "client_id": client_id,
             }
             self._ros_goal_lookup[ros_goal_id] = unity_goal_id
-        self.tcp_server.unity_tcp_sender.send_action_goal_response(
-            self.action_name,
-            unity_goal_id,
-            True,
-            ros_goal_id=ros_goal_id,
-            client_id=client_id,
-        )
+            # Queue acceptance before the health timer can emit a terminal result.
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name,
+                unity_goal_id,
+                True,
+                ros_goal_id=ros_goal_id,
+                client_id=client_id,
+            )
         self.get_logger().info(
             "Goal %s accepted on %s (ROS id %s)"
             % (unity_goal_id, self.action_name, ros_goal_id)
@@ -177,19 +226,37 @@ class RosActionClient(RosSender):
         )
 
     def _on_result_response(self, unity_goal_id, client_id, future):
+        goal_meta = self._take_goal(unity_goal_id)
+        if goal_meta is None:
+            # A server shutdown or another terminal path already completed it.
+            return
+
         try:
             result = future.result()
         except Exception as exc:  # noqa pylint: disable=broad-except
+            self.tcp_server.unity_tcp_sender.send_action_result(
+                self.action_name,
+                unity_goal_id,
+                GoalStatus.STATUS_ABORTED,
+                self.action_type.Result(),
+                client_id=client_id,
+            )
             self._emit_unity_error(
                 f"Result future for goal {unity_goal_id} on '{self.action_name}' failed: {exc}",
                 client_id=client_id,
             )
-            self._cleanup_goal(unity_goal_id)
             return
 
         status = getattr(result, "status", GoalStatus.STATUS_UNKNOWN)
         result_msg = getattr(result, "result", None)
         if result_msg is None:
+            self.tcp_server.unity_tcp_sender.send_action_result(
+                self.action_name,
+                unity_goal_id,
+                GoalStatus.STATUS_ABORTED,
+                self.action_type.Result(),
+                client_id=client_id,
+            )
             self._emit_unity_error(
                 f"No result payload for goal {unity_goal_id} on '{self.action_name}'",
                 client_id=client_id,
@@ -202,8 +269,6 @@ class RosActionClient(RosSender):
                 result_msg,
                 client_id=client_id,
             )
-
-        self._cleanup_goal(unity_goal_id)
 
     def _on_cancel_response(self, unity_goal_id, future):
         try:
@@ -224,13 +289,56 @@ class RosActionClient(RosSender):
                 % (unity_goal_id, self.action_name, exc)
             )
 
-    def _cleanup_goal(self, unity_goal_id):
+    def _take_goal(self, unity_goal_id):
         with self._lock:
             goal_meta = self._pending_goals.pop(unity_goal_id, None)
             if goal_meta:
                 ros_goal_id = goal_meta.get("ros_goal_id")
                 if ros_goal_id in self._ros_goal_lookup:
                     del self._ros_goal_lookup[ros_goal_id]
+            return goal_meta
+
+    def _check_server_health(self):
+        """Finish TCP-side requests if a ROS action server disappears."""
+        if self._client.server_is_ready():
+            return
+
+        with self._lock:
+            inflight_goals = list(self._inflight_goals.items())
+            self._inflight_goals.clear()
+            pending_goal_ids = list(self._pending_goals.keys())
+
+        for goal_id, client_id in inflight_goals:
+            message = (
+                f"Action server '{self.action_name}' shut down while accepting goal "
+                f"{goal_id}"
+            )
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name,
+                goal_id,
+                False,
+                message=message,
+                client_id=client_id,
+            )
+            self._emit_unity_error(message, client_id=client_id)
+
+        for goal_id in pending_goal_ids:
+            goal_meta = self._take_goal(goal_id)
+            if goal_meta is None:
+                continue
+            client_id = goal_meta.get("client_id")
+            self.tcp_server.unity_tcp_sender.send_action_result(
+                self.action_name,
+                goal_id,
+                GoalStatus.STATUS_ABORTED,
+                self.action_type.Result(),
+                client_id=client_id,
+            )
+            self._emit_unity_error(
+                f"Action server '{self.action_name}' shut down while waiting for "
+                f"goal {goal_id}",
+                client_id=client_id,
+            )
 
     def _ros_uuid_to_str(self, goal_id):
         return "".join(["{:02x}".format(b) for b in goal_id.uuid])

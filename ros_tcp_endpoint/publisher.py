@@ -12,12 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
 import re
 
-from rclpy.serialization import deserialize_message
-
-from .communication import RosSender
+from .communication import (
+    RosSender,
+    deserialize_ros_message,
+    message_type_is_effectively_empty,
+)
 
 
 class RosPublisher(RosSender):
@@ -51,8 +52,18 @@ class RosPublisher(RosSender):
         Returns:
             None: Explicitly return None so behaviour can be
         """
-        # message_type = type(self.msg)
-        # message = deserialize_message(data, message_type)
+        message_type = type(self.msg)
+        if message_type_is_effectively_empty(message_type):
+            try:
+                data = deserialize_ros_message(data, message_type)
+            except Exception as exc:  # noqa: pylint: disable=broad-except
+                self.get_logger().error(
+                    "Ignoring malformed fieldless topic message "
+                    "(payload_len={}, prefix={}): {}".format(
+                        len(data), bytes(data[:16]).hex(), exc
+                    )
+                )
+                return None
 
         self.pub.publish(data)
 
