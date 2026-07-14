@@ -16,9 +16,7 @@ import re
 import threading
 import time
 
-from rclpy.serialization import deserialize_message
-
-from .communication import RosSender
+from .communication import RosSender, deserialize_service_message
 
 
 class RosService(RosSender):
@@ -49,19 +47,6 @@ class RosService(RosSender):
                 )
             )
 
-    @staticmethod
-    def _request_is_effectively_empty(request_type):
-        try:
-            field_map = request_type.get_fields_and_field_types()
-        except Exception:  # noqa: pylint: disable=broad-except
-            return False
-
-        if not field_map:
-            return True
-
-        # ROS2 may add this placeholder field for empty request structs.
-        return set(field_map.keys()) <= {"structure_needs_at_least_one_member"}
-
     def send(self, data):
         """
         Takes in serialized message data from source outside of the ROS network,
@@ -77,21 +62,14 @@ class RosService(RosSender):
         message_type = type(self.req)
 
         try:
-            message = deserialize_message(data, message_type)
+            message = deserialize_service_message(data, message_type)
         except Exception as exc:  # noqa: pylint: disable=broad-except
-            if self._request_is_effectively_empty(message_type):
-                self.get_logger().warning(
-                    "Service {} received non-deserializable payload for empty request; "
-                    "using default request instance. Error: {}".format(self.service_topic, exc)
+            self.get_logger().error(
+                "Ignoring service call to {} - failed to deserialize request: {}".format(
+                    self.service_topic, exc
                 )
-                message = message_type()
-            else:
-                self.get_logger().error(
-                    "Ignoring service call to {} - failed to deserialize request: {}".format(
-                        self.service_topic, exc
-                    )
-                )
-                return None
+            )
+            return None
 
         if not self.cli.service_is_ready():
             now = time.monotonic()

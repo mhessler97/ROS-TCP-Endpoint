@@ -157,16 +157,24 @@ class ClientThread(threading.Thread):
         return cmd_info + json_info
 
     def send_ros_service_request(self, srv_id, destination, data):
-        if destination not in self.tcp_server.ros_services_table:
+        ros_communicator = self.tcp_server.get_owned_registration(
+            self.tcp_server.ros_services_table,
+            self.tcp_server.ros_service_clients,
+            destination,
+            self.client_id,
+        )
+        if ros_communicator is None:
             error_msg = "Service destination '{}' is not registered! Known services are: {} ".format(
-                destination, self.tcp_server.ros_services_table.keys()
+                destination,
+                self.tcp_server.get_registration_keys(
+                    self.tcp_server.ros_services_table
+                ),
             )
             self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
             self.tcp_server.logerr(error_msg)
             # TODO: send a response to Unity anyway?
             return
         else:
-            ros_communicator = self.tcp_server.ros_services_table[destination]
             if not self.tcp_server.submit_service_call(
                 self.service_call_thread, srv_id, destination, data, ros_communicator
             ):
@@ -287,15 +295,24 @@ class ClientThread(threading.Thread):
                 elif destination.startswith("__"):
                     # handle a system command, such as registering new topics
                     self.tcp_server.handle_syscommand(destination, data, client_thread=self)
-                elif destination in self.tcp_server.publishers_table:
-                    ros_communicator = self.tcp_server.publishers_table[destination]
-                    ros_communicator.send(data)
                 else:
-                    error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
-                        destination, self.tcp_server.publishers_table.keys()
+                    ros_communicator = self.tcp_server.get_owned_registration(
+                        self.tcp_server.publishers_table,
+                        self.tcp_server.publisher_clients,
+                        destination,
+                        self.client_id,
                     )
-                    self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
-                    self.tcp_server.logerr(error_msg)
+                    if ros_communicator is not None:
+                        ros_communicator.send(data)
+                    else:
+                        error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
+                            destination,
+                            self.tcp_server.get_registration_keys(
+                                self.tcp_server.publishers_table
+                            ),
+                        )
+                        self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
+                        self.tcp_server.logerr(error_msg)
         except IOError as e:
             self.tcp_server.logerr("Exception: {}".format(e))
         finally:
@@ -333,10 +350,17 @@ class ClientThread(threading.Thread):
         if action_name is None:
             action_name = destination
 
-        action_client = self.tcp_server.ros_action_clients.get(action_name)
+        action_client = self.tcp_server.get_owned_registration(
+            self.tcp_server.ros_action_clients,
+            self.tcp_server.ros_action_clients_owner,
+            action_name,
+            self.client_id,
+        )
         if action_client is None:
             # Provide better diagnostics to help track mismatches/race conditions
-            known = list(self.tcp_server.ros_action_clients.keys())
+            known = self.tcp_server.get_registration_keys(
+                self.tcp_server.ros_action_clients
+            )
             error_msg = "Action goal received for unregistered action '{}' (known actions: {})".format(
                 action_name, known
             )
@@ -344,10 +368,15 @@ class ClientThread(threading.Thread):
             self.tcp_server.logerr(error_msg)
             return
 
-        action_client.send_goal(goal_id, data)
+        action_client.send_goal(goal_id, data, client_id=self.client_id)
 
     def _deliver_unity_action_feedback(self, action_name, goal_id, data):
-        action_server = self.tcp_server.unity_action_servers.get(action_name)
+        action_server = self.tcp_server.get_owned_registration(
+            self.tcp_server.unity_action_servers,
+            self.tcp_server.unity_action_servers_owner,
+            action_name,
+            self.client_id,
+        )
         if action_server is None:
             error_msg = "Action feedback received for unregistered Unity action '{}'".format(action_name)
             self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
@@ -357,7 +386,12 @@ class ClientThread(threading.Thread):
         action_server.handle_unity_feedback(goal_id, data)
 
     def _deliver_unity_action_result(self, action_name, goal_id, status, data):
-        action_server = self.tcp_server.unity_action_servers.get(action_name)
+        action_server = self.tcp_server.get_owned_registration(
+            self.tcp_server.unity_action_servers,
+            self.tcp_server.unity_action_servers_owner,
+            action_name,
+            self.client_id,
+        )
         if action_server is None:
             error_msg = "Action result received for unregistered Unity action '{}'".format(action_name)
             self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)

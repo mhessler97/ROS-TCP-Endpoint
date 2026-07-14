@@ -15,9 +15,8 @@
 import threading
 import json
 
-from rclpy.serialization import deserialize_message
-
 from .client import ClientThread
+from .communication import deserialize_service_message
 from .thread_pauser import ThreadPauser
 
 # queue module was renamed between python 2 and 3
@@ -72,7 +71,8 @@ class UnityTcpSender:
     def _resolve_owner(self, owner_table, key, client_id=None):
         if client_id is not None:
             return client_id
-        return owner_table.get(key)
+        with self.tcp_server._state_lock:
+            return owner_table.get(key)
 
     def send_unity_info(self, text, client_id=None):
         command = SysCommand_Log()
@@ -123,8 +123,10 @@ class UnityTcpSender:
                 )
             )
 
-    def send_action_feedback(self, topic, goal_id, feedback_msg):
-        target_client_id = self._resolve_owner(self.tcp_server.ros_action_clients_owner, topic)
+    def send_action_feedback(self, topic, goal_id, feedback_msg, client_id=None):
+        target_client_id = self._resolve_owner(
+            self.tcp_server.ros_action_clients_owner, topic, client_id=client_id
+        )
         if target_client_id is None:
             self.tcp_server.logwarn(
                 "Dropping action feedback for '{}' goal {} because no client owns this action".format(
@@ -144,8 +146,10 @@ class UnityTcpSender:
                 )
             )
 
-    def send_action_result(self, topic, goal_id, status, result_msg):
-        target_client_id = self._resolve_owner(self.tcp_server.ros_action_clients_owner, topic)
+    def send_action_result(self, topic, goal_id, status, result_msg, client_id=None):
+        target_client_id = self._resolve_owner(
+            self.tcp_server.ros_action_clients_owner, topic, client_id=client_id
+        )
         if target_client_id is None:
             self.tcp_server.logwarn(
                 "Dropping action result for '{}' goal {} because no client owns this action".format(
@@ -167,10 +171,10 @@ class UnityTcpSender:
             )
 
     def send_action_goal_response(
-        self, action_name, goal_id, accepted, ros_goal_id="", message=""
+        self, action_name, goal_id, accepted, ros_goal_id="", message="", client_id=None
     ):
         target_client_id = self._resolve_owner(
-            self.tcp_server.ros_action_clients_owner, action_name
+            self.tcp_server.ros_action_clients_owner, action_name, client_id=client_id
         )
         if target_client_id is None:
             self.tcp_server.logwarn(
@@ -286,7 +290,7 @@ class UnityTcpSender:
             return None
 
         try:
-            return deserialize_message(thread_pauser.result, service_class.Response())
+            return deserialize_service_message(thread_pauser.result, service_class.Response)
         except Exception as exc:  # noqa: pylint: disable=broad-except
             self.tcp_server.logerr(
                 "Failed to deserialize Unity service response {} for '{}': {}".format(
@@ -346,15 +350,15 @@ class UnityTcpSender:
                 thread_pauser.resume_with_result(None)
 
     def get_registered_topic(self, topic):
-        if topic in self.tcp_server.publishers_table:
-            return self.tcp_server.publishers_table[topic]
-        elif topic in self.tcp_server.subscribers_table:
-            return self.tcp_server.subscribers_table[topic]
-        elif topic in self.tcp_server.ros_services_table:
-            return self.tcp_server.ros_services_table[topic]
-        elif topic in self.tcp_server.unity_services_table:
-            return self.tcp_server.unity_services_table[topic]
-        else:
+        with self.tcp_server._state_lock:
+            if topic in self.tcp_server.publishers_table:
+                return self.tcp_server.publishers_table[topic]
+            if topic in self.tcp_server.subscribers_table:
+                return self.tcp_server.subscribers_table[topic]
+            if topic in self.tcp_server.ros_services_table:
+                return self.tcp_server.ros_services_table[topic]
+            if topic in self.tcp_server.unity_services_table:
+                return self.tcp_server.unity_services_table[topic]
             return None
 
     def send_topic_list(self, client_id=None):
