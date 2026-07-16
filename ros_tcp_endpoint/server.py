@@ -557,7 +557,9 @@ class SysCommands:
         normalized = '/' + '/'.join(parts) if parts else ''
         return normalized
 
-    def subscribe(self, topic, message_name):
+    def subscribe(
+        self, topic, message_name, queue_size=10, latch=False, qos=None
+    ):
         if topic == "":
             self.tcp_server.send_unity_error(
                 "Can't subscribe to a blank topic name! SysCommand.subscribe({}, {})".format(
@@ -577,7 +579,14 @@ class SysCommands:
             self.tcp_server.subscribers_table,
             self.tcp_server.subscriber_clients,
             topic,
-            lambda: RosSubscriber(topic, message_class, self.tcp_server),
+            lambda: RosSubscriber(
+                topic,
+                message_class,
+                self.tcp_server,
+                queue_size=queue_size,
+                latch=latch,
+                qos=qos,
+            ),
             "subscriber",
         ):
             self.tcp_server.loginfo("RegisterSubscriber({}, {}) OK".format(topic, message_class))
@@ -597,7 +606,7 @@ class SysCommands:
         ):
             self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
 
-    def publish(self, topic, message_name, queue_size=10, latch=False):
+    def publish(self, topic, message_name, queue_size=10, latch=False, qos=None):
         if topic == "":
             self.tcp_server.send_unity_error(
                 "Can't publish to a blank topic name! SysCommand.publish({}, {})".format(
@@ -618,7 +627,11 @@ class SysCommands:
             self.tcp_server.publisher_clients,
             topic,
             lambda: RosPublisher(
-                topic, message_class, queue_size=queue_size, latch=latch
+                topic,
+                message_class,
+                queue_size=queue_size,
+                latch=latch,
+                qos=qos,
             ),
             "publisher",
         ):

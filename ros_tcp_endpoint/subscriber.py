@@ -12,14 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
-import socket
 import re
 
-from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
-from rclpy.qos import QoSProfile
-
 from .communication import RosReceiver
+from .qos import make_qos_profile
 
 
 class RosSubscriber(RosReceiver):
@@ -27,13 +23,17 @@ class RosSubscriber(RosReceiver):
     Class to send messages outside of ROS network
     """
 
-    def __init__(self, topic, message_class, tcp_server, queue_size=10):
+    def __init__(
+        self, topic, message_class, tcp_server, queue_size=10, latch=False, qos=None
+    ):
         """
 
         Args:
             topic:         Topic name to publish messages to
             message_class: The message class in catkin workspace
             queue_size:    Max number of entries to maintain in an outgoing queue
+            latch:         Use transient-local durability for late joiners
+            qos:           Optional QoS preset name or policy dictionary
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
         self.node_name = f"{strippedTopic}_RosSubscriber"
@@ -43,11 +43,13 @@ class RosSubscriber(RosReceiver):
         self.tcp_server = tcp_server
         self.queue_size = queue_size
 
-        qos_profile = QoSProfile(depth=queue_size)
+        self.qos_profile = make_qos_profile(
+            queue_size=queue_size, latch=latch, qos=qos
+        )
 
         # Start Subscriber listener function
         self.subscription = self.create_subscription(
-            self.msg, self.topic, self.send, qos_profile  # queue_size
+            self.msg, self.topic, self.send, self.qos_profile
         )
         self.subscription
 

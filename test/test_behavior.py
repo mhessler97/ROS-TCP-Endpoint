@@ -22,6 +22,11 @@ from action_msgs.msg import GoalStatus
 from example_interfaces.action import Fibonacci
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSReliabilityPolicy,
+)
 from rclpy.serialization import serialize_message
 from rclpy.task import Future
 from std_msgs.msg import Empty as EmptyMessage
@@ -32,6 +37,7 @@ from ros_tcp_endpoint.communication import (
     deserialize_service_message,
     payload_is_effectively_empty,
 )
+from ros_tcp_endpoint.qos import make_qos_profile
 from ros_tcp_endpoint.service import RosService
 from ros_tcp_endpoint.server import SysCommands
 from ros_tcp_endpoint.tcp_sender import UnityTcpSender
@@ -122,6 +128,65 @@ def test_empty_service_request_and_response_types_accept_empty_payloads():
     assert isinstance(
         deserialize_service_message(serialize_message(response), Empty.Response), Empty.Response
     )
+
+
+def test_legacy_topic_qos_defaults_are_preserved():
+    profile = make_qos_profile(queue_size=17)
+
+    assert profile.depth == 17
+    assert profile.history == QoSHistoryPolicy.KEEP_LAST
+    assert profile.reliability == QoSReliabilityPolicy.RELIABLE
+    assert profile.durability == QoSDurabilityPolicy.VOLATILE
+
+
+def test_legacy_latch_enables_transient_local_durability():
+    profile = make_qos_profile(queue_size=4, latch=True)
+
+    assert profile.depth == 4
+    assert profile.durability == QoSDurabilityPolicy.TRANSIENT_LOCAL
+
+
+def test_topic_qos_presets_and_overrides_are_supported():
+    sensor_profile = make_qos_profile(qos="sensor-data")
+    assert sensor_profile.reliability == QoSReliabilityPolicy.BEST_EFFORT
+    assert sensor_profile.durability == QoSDurabilityPolicy.VOLATILE
+
+    custom_profile = make_qos_profile(
+        queue_size=10,
+        qos={
+            "preset": "transient_local",
+            "history": "keep_all",
+            "depth": 23,
+        },
+    )
+    assert custom_profile.depth == 23
+    assert custom_profile.history == QoSHistoryPolicy.KEEP_ALL
+    assert custom_profile.reliability == QoSReliabilityPolicy.RELIABLE
+    assert custom_profile.durability == QoSDurabilityPolicy.TRANSIENT_LOCAL
+
+
+def test_latch_wins_over_conflicting_explicit_durability():
+    profile = make_qos_profile(
+        latch=True,
+        qos={"durability": "volatile"},
+    )
+    assert profile.durability == QoSDurabilityPolicy.TRANSIENT_LOCAL
+
+
+@pytest.mark.parametrize(
+    "qos",
+    [
+        "unknown",
+        {"reliability": "sometimes"},
+        {"durability": "forever"},
+        {"history": "everything_recent"},
+        {"depth": 0},
+        {"unexpected": True},
+    ],
+)
+def test_invalid_topic_qos_is_rejected(qos):
+    with pytest.raises(ValueError):
+        make_qos_profile(qos=qos)
 
 
 @pytest.mark.parametrize(
@@ -331,6 +396,52 @@ class FakeTcpServer:
         pass
 
 
+def test_subscribe_command_forwards_optional_qos_without_changing_legacy_api(
+    monkeypatch,
+):
+    tcp_server = FakeTcpServer(client_id=1)
+    commands = SysCommands(tcp_server)
+    commands.resolve_message_name = lambda name, extension_hint=None: object
+    captured = {}
+
+    def make_subscriber(topic, message_class, server, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("ros_tcp_endpoint.server.RosSubscriber", make_subscriber)
+    commands.subscribe(
+        "/qos",
+        "std_msgs/String",
+        queue_size=7,
+        qos={"reliability": "best_effort", "durability": "transient_local"},
+    )
+
+    assert captured == {
+        "queue_size": 7,
+        "latch": False,
+        "qos": {
+            "reliability": "best_effort",
+            "durability": "transient_local",
+        },
+    }
+
+
+def test_subscribe_command_forwards_legacy_latch_flag(monkeypatch):
+    tcp_server = FakeTcpServer(client_id=1)
+    commands = SysCommands(tcp_server)
+    commands.resolve_message_name = lambda name, extension_hint=None: object
+    captured = {}
+
+    def make_subscriber(topic, message_class, server, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("ros_tcp_endpoint.server.RosSubscriber", make_subscriber)
+    commands.subscribe("/latched", "std_msgs/String", latch=True)
+
+    assert captured == {"queue_size": 10, "latch": True, "qos": None}
+
+
 def test_registration_cannot_replace_or_remove_another_clients_node(monkeypatch):
     tcp_server = FakeTcpServer(client_id=2)
     original_node = object()
@@ -340,7 +451,7 @@ def test_registration_cannot_replace_or_remove_another_clients_node(monkeypatch)
     commands.resolve_message_name = lambda name, extension_hint=None: object
     monkeypatch.setattr(
         "ros_tcp_endpoint.server.RosSubscriber",
-        lambda topic, message_class, server: object(),
+        lambda topic, message_class, server, **kwargs: object(),
     )
 
     commands.subscribe("/shared", "std_msgs/String")
@@ -362,7 +473,7 @@ def test_owner_can_replace_and_remove_its_node(monkeypatch):
     commands.resolve_message_name = lambda name, extension_hint=None: object
     monkeypatch.setattr(
         "ros_tcp_endpoint.server.RosSubscriber",
-        lambda topic, message_class, server: replacement_node,
+        lambda topic, message_class, server, **kwargs: replacement_node,
     )
 
     commands.subscribe("/shared", "std_msgs/String")
@@ -381,7 +492,7 @@ def test_concurrent_clients_cannot_both_claim_the_same_registration(monkeypatch)
     commands = SysCommands(tcp_server)
     commands.resolve_message_name = lambda name, extension_hint=None: object
 
-    def make_subscriber(topic, message_class, server):
+    def make_subscriber(topic, message_class, server, **kwargs):
         return SimpleNamespace(created_by=server.get_active_client().client_id)
 
     monkeypatch.setattr("ros_tcp_endpoint.server.RosSubscriber", make_subscriber)

@@ -19,6 +19,7 @@ from .communication import (
     deserialize_ros_message,
     message_type_is_effectively_empty,
 )
+from .qos import make_qos_profile
 
 
 class RosPublisher(RosSender):
@@ -26,20 +27,24 @@ class RosPublisher(RosSender):
     Class to publish messages to a ROS topic
     """
 
-    # TODO: surface latch functionality
-    def __init__(self, topic, message_class, queue_size=10, latch=False):
+    def __init__(self, topic, message_class, queue_size=10, latch=False, qos=None):
         """
 
         Args:
             topic:         Topic name to publish messages to
             message_class: The message class in catkin workspace
             queue_size:    Max number of entries to maintain in an outgoing queue
+            latch:         Use transient-local durability for late joiners
+            qos:           Optional QoS preset name or policy dictionary
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
         node_name = f"{strippedTopic}_RosPublisher"
         RosSender.__init__(self, node_name)
         self.msg = message_class()
-        self.pub = self.create_publisher(message_class, topic, queue_size)
+        self.qos_profile = make_qos_profile(
+            queue_size=queue_size, latch=latch, qos=qos
+        )
+        self.pub = self.create_publisher(message_class, topic, self.qos_profile)
 
     def send(self, data):
         """

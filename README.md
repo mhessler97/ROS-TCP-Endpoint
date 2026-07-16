@@ -8,6 +8,55 @@
 
 Instructions and examples on how to use this ROS package can be found on the [Unity Robotics Hub](https://github.com/Unity-Technologies/Unity-Robotics-Hub/blob/master/tutorials/ros_unity_integration/README.md) repository.
 
+## ROS2 Topic QoS
+
+Topic publisher and subscriber registration commands may include an optional `qos`
+field. Omitting it preserves the existing ROS-TCP behavior: reliable, volatile,
+keep-last delivery with depth controlled by `queue_size` (default 10).
+
+The `qos` field may be a preset name:
+
+```json
+{
+  "topic": "/camera/image",
+  "message_name": "sensor_msgs/Image",
+  "qos": "sensor_data"
+}
+```
+
+Or an object containing a preset and individual overrides:
+
+```json
+{
+  "topic": "/map_metadata",
+  "message_name": "nav_msgs/MapMetaData",
+  "qos": {
+    "preset": "transient_local",
+    "reliability": "reliable",
+    "durability": "transient_local",
+    "history": "keep_last",
+    "depth": 1
+  }
+}
+```
+
+Supported presets are `default`, `sensor_data`, `transient_local`, and `latched`.
+For every preset, `queue_size` remains the depth fallback and a nested `depth`
+value takes precedence.
+Supported policy values are:
+
+- Reliability: `system_default`, `reliable`, or `best_effort`.
+- Durability: `system_default`, `volatile`, or `transient_local`.
+- History: `system_default`, `keep_last`, or `keep_all`.
+- Depth: any positive integer.
+
+The legacy publisher registration fields remain supported. In particular,
+`"latch": true` now creates a transient-local publisher and retains the configured
+number of samples for compatible late-joining subscribers. The same optional QoS
+format is accepted by both `__publish` and `__subscribe` commands. A Unity client
+subscribing to a latched ROS topic must request `transient_local` durability to
+receive samples published before its subscription was created.
+
 ## ROS2 Action Support (Preview)
 
 Version 0.8.0 introduces an experimental ROS2 action bridge so Unity experiences can send action goals, stream feedback, and finalize results through the same TCP session used for topics and services. The feature is off by default for older connectors; Unity clients must negotiate the `actions-preview` capability during the handshake and emit the following syscommands before sending the serialized ROS messages:

@@ -494,4 +494,4 @@ class SysCommand_Handshake:
 class SysCommand_Handshake_Metadata:
     def __init__(self):
         self.protocol = "ROS2"
-        self.features = ["actions-preview"]
+        self.features = ["actions-preview", "topic-qos"]

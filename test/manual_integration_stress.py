@@ -26,6 +26,7 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
 from std_msgs.msg import Empty as EmptyMessage
 from std_msgs.msg import String
@@ -97,7 +98,10 @@ class RawClient:
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
         handshake = self.receive("__handshake", timeout=10)
-        assert json.loads(handshake.decode("utf-8"))["version"] == "v0.8.0"
+        handshake_data = json.loads(handshake.decode("utf-8"))
+        assert handshake_data["version"] == "v0.8.0"
+        handshake_metadata = json.loads(handshake_data["metadata"])
+        assert "topic-qos" in handshake_metadata["features"]
 
     def _read_loop(self):
         try:
@@ -414,6 +418,153 @@ def main():
         client2.expect_error("owned by another client")
         delivered = publish_until_received(to_unity_publisher, client1, "/to_unity")
         assert delivered.data.startswith("ros-message-")
+
+        print("[stress] testing backward-compatible topic QoS and late joiners")
+        latch_probe_event = threading.Event()
+        latch_probe_messages = []
+        latch_probe = ros_node.create_subscription(
+            String,
+            "/latched_from_unity",
+            lambda message: (
+                latch_probe_messages.append(message.data),
+                latch_probe_event.set(),
+            ),
+            10,
+            callback_group=callback_group,
+        )
+        client1.send_command(
+            "__publish",
+            {
+                "topic": "/latched_from_unity",
+                "message_name": "std_msgs/String",
+                "queue_size": 3,
+                "latch": True,
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.publisher_clients, "/latched_from_unity", 2
+            ),
+            message="latched publisher registration",
+        )
+        latched_bridge = endpoint.get_registration(
+            endpoint.publishers_table, "/latched_from_unity"
+        )
+        assert latched_bridge.qos_profile.depth == 3
+        assert (
+            latched_bridge.qos_profile.durability
+            == QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
+        retained_values = ["retained-{}".format(index) for index in range(5)]
+        for retained_value in retained_values:
+            latch_probe_event.clear()
+            client1.send_message(
+                "/latched_from_unity",
+                serialize_message(String(data=retained_value)),
+            )
+            assert latch_probe_event.wait(5)
+        assert latch_probe_messages == retained_values
+        ros_node.destroy_subscription(latch_probe)
+
+        late_latch_event = threading.Event()
+        late_latch_messages = []
+        ros_node.create_subscription(
+            String,
+            "/latched_from_unity",
+            lambda message: (
+                late_latch_messages.append(message.data),
+                late_latch_event.set(),
+            ),
+            QoSProfile(
+                depth=3,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+            callback_group=callback_group,
+        )
+        assert late_latch_event.wait(5)
+        wait_until(
+            lambda: len(late_latch_messages) == 3,
+            timeout=5,
+            message="all retained transient-local samples",
+        )
+        assert late_latch_messages == retained_values[-3:]
+
+        transient_ros_publisher = ros_node.create_publisher(
+            String,
+            "/transient_to_unity",
+            QoSProfile(
+                depth=2,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        transient_ros_publisher.publish(String(data="retained-from-ros"))
+        time.sleep(0.1)
+        client1.send_command(
+            "__subscribe",
+            {
+                "topic": "/transient_to_unity",
+                "message_name": "std_msgs/String",
+                "latch": True,
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.subscriber_clients, "/transient_to_unity", 2
+            ),
+            message="transient-local subscriber registration",
+        )
+        retained_from_ros = deserialize_message(
+            client1.receive("/transient_to_unity", timeout=10), String
+        )
+        assert retained_from_ros.data == "retained-from-ros"
+
+        best_effort_publisher = ros_node.create_publisher(
+            String,
+            "/best_effort_to_unity",
+            QoSProfile(
+                depth=5,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
+        )
+        client1.send_command(
+            "__subscribe",
+            {
+                "topic": "/best_effort_to_unity",
+                "message_name": "std_msgs/String",
+                "qos": "sensor_data",
+            },
+        )
+        wait_until(
+            lambda: endpoint.client_owns(
+                endpoint.subscriber_clients, "/best_effort_to_unity", 2
+            ),
+            message="best-effort subscriber registration",
+        )
+        best_effort_bridge = endpoint.get_registration(
+            endpoint.subscribers_table, "/best_effort_to_unity"
+        )
+        assert (
+            best_effort_bridge.qos_profile.reliability
+            == QoSReliabilityPolicy.BEST_EFFORT
+        )
+        best_effort_message = publish_until_received(
+            best_effort_publisher, client1, "/best_effort_to_unity"
+        )
+        assert best_effort_message.data.startswith("ros-message-")
+
+        client1.send_command(
+            "__subscribe",
+            {
+                "topic": "/invalid_qos",
+                "message_name": "std_msgs/String",
+                "qos": {"durability": "permanent"},
+            },
+        )
+        client1.expect_error("Failed to register subscriber", timeout=5)
+        assert "/invalid_qos" not in endpoint.subscribers_table
 
         print("[stress] testing empty and non-empty Unity-to-ROS service calls")
         client1.send_command(
