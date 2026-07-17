@@ -22,6 +22,10 @@ Added Sonarqube scanner
 
 ### Fixed
 
+- Preserve pending service and action payload state when topic-list requests,
+  keepalives, topic messages, or additional payload headers are interleaved on
+  the same TCP connection.
+
 
 ## [0.7.0] - 2022-02-01
 

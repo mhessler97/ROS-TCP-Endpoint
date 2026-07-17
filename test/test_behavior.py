@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
 import threading
 import time
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from ros_tcp_endpoint.communication import (
     deserialize_service_message,
     payload_is_effectively_empty,
 )
+from ros_tcp_endpoint.client import ClientThread
 from ros_tcp_endpoint.qos import make_qos_profile
 from ros_tcp_endpoint.service import RosService
 from ros_tcp_endpoint.server import SysCommands
@@ -128,6 +130,156 @@ def test_empty_service_request_and_response_types_accept_empty_payloads():
     assert isinstance(
         deserialize_service_message(serialize_message(response), Empty.Response), Empty.Response
     )
+
+
+@pytest.mark.parametrize("pending_is_request", [True, False])
+def test_syscommand_between_service_header_and_payload_preserves_pending_state(
+    pending_is_request,
+):
+    handled_commands = []
+    service_requests = []
+    service_responses = []
+    published_messages = []
+    ros_service = object()
+    unity_service = object()
+    publisher = SimpleNamespace(send=lambda data: published_messages.append(data))
+    server = SimpleNamespace(
+        handle_syscommand=lambda destination, data, client_thread: handled_commands.append(
+            (destination, data, client_thread)
+        ),
+        send_unity_service_response=lambda srv_id, data, client_id: service_responses.append(
+            (srv_id, data, client_id)
+        ),
+        ros_services_table={"/empty_ros": ros_service},
+        ros_service_clients={"/empty_ros": 7},
+        unity_services_table={"/empty_ros": unity_service},
+        unity_service_clients={"/empty_ros": 7},
+        publishers_table={"/interleaved_topic": publisher},
+        publisher_clients={"/interleaved_topic": 7},
+        get_owned_registration=lambda table, owners, destination, client_id: (
+            table.get(destination) if owners.get(destination) == client_id else None
+        ),
+    )
+    client = object.__new__(ClientThread)
+    client.tcp_server = server
+    client.client_id = 7
+    client.pending_srv_id = 42
+    client.pending_srv_is_request = pending_is_request
+    client.pending_action = None
+    client.pending_payload_deadline = 123.0
+    client.deferred_payload_headers = deque()
+    client.send_ros_service_request = (
+        lambda srv_id, destination, data: service_requests.append(
+            (srv_id, destination, data)
+        )
+    )
+
+    client.process_frame("__topic_list", b"{}")
+
+    assert handled_commands == [("__topic_list", b"{}", client)]
+    assert client.pending_srv_id == 42
+    assert client.pending_payload_deadline == 123.0
+
+    client.process_frame("/interleaved_topic", b"topic-data")
+
+    assert published_messages == [b"topic-data"]
+    assert client.pending_srv_id == 42
+    assert client.pending_payload_deadline == 123.0
+
+    client.process_frame("/empty_ros", b"")
+
+    assert client.pending_srv_id is None
+    assert client.pending_payload_deadline is None
+    if pending_is_request:
+        assert service_requests == [(42, "/empty_ros", b"")]
+        assert service_responses == []
+    else:
+        assert service_requests == []
+        assert service_responses == [(42, b"", 7)]
+
+
+def test_keepalive_and_syscommand_do_not_consume_pending_action_payload():
+    handled_commands = []
+    server = SimpleNamespace(
+        handle_syscommand=lambda destination, data, client_thread: handled_commands.append(
+            (destination, data, client_thread)
+        )
+    )
+    client = object.__new__(ClientThread)
+    client.tcp_server = server
+    client.client_id = 8
+    client.pending_srv_id = None
+    client.pending_srv_is_request = False
+    client.pending_action = {"action_name": "/example", "phase": "goal_to_ros"}
+    client.pending_payload_deadline = 456.0
+    client.deferred_payload_headers = deque()
+
+    client.process_frame("", b"")
+    client.process_frame("__topic_list", b"{}")
+
+    assert handled_commands == [("__topic_list", b"{}", client)]
+    assert client.pending_action == {
+        "action_name": "/example",
+        "phase": "goal_to_ros",
+    }
+    assert client.pending_payload_deadline == 456.0
+
+
+def test_second_payload_header_is_deferred_until_first_payload_arrives():
+    activated_headers = []
+    service_requests = []
+    server = SimpleNamespace()
+    client = object.__new__(ClientThread)
+    client.tcp_server = server
+    client.client_id = 9
+    client.pending_srv_id = 41
+    client.pending_srv_is_request = True
+    client.pending_action = None
+    client.pending_payload_deadline = 100.0
+    client.pending_payload_timeout_sec = 5.0
+    client.deferred_payload_headers = deque()
+    client.send_ros_service_request = (
+        lambda srv_id, destination, data: service_requests.append(
+            (srv_id, destination, data)
+        )
+    )
+
+    def handle_syscommand(destination, data, client_thread):
+        activated_headers.append((destination, data))
+        client_thread.set_pending_service(42, is_request=True)
+
+    server.handle_syscommand = handle_syscommand
+    server.ros_services_table = {"/empty_ros": object()}
+    server.ros_service_clients = {"/empty_ros": 9}
+    server.unity_services_table = {}
+    server.unity_service_clients = {}
+    server.publishers_table = {}
+    server.publisher_clients = {}
+    server.get_owned_registration = lambda table, owners, destination, client_id: (
+        table.get(destination) if owners.get(destination) == client_id else None
+    )
+
+    client.process_frame("__request", b'{"srv_id": 42}')
+
+    assert activated_headers == []
+    assert list(client.deferred_payload_headers) == [
+        ("__request", b'{"srv_id": 42}')
+    ]
+    assert client.pending_srv_id == 41
+
+    client.process_frame("/empty_ros", b"first")
+
+    assert service_requests == [(41, "/empty_ros", b"first")]
+    assert activated_headers == [("__request", b'{"srv_id": 42}')]
+    assert client.pending_srv_id == 42
+
+    client.process_frame("/empty_ros", b"second")
+
+    assert service_requests == [
+        (41, "/empty_ros", b"first"),
+        (42, "/empty_ros", b"second"),
+    ]
+    assert client.pending_srv_id is None
 
 
 def test_legacy_topic_qos_defaults_are_preserved():

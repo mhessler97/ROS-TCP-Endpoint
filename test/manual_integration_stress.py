@@ -590,6 +590,57 @@ def main():
             )
         assert len(empty_calls) == len(empty_request_encodings)
 
+        print("[stress] reproducing syscommand interleaving during a service request")
+        interleaved_service_id = 509
+        client1.send_command("__request", {"srv_id": interleaved_service_id})
+        client1.send_command("__topic_list", {})
+        client1.send_message("", b"")
+        from_unity_event.clear()
+        client1.send_message(
+            "/from_unity", serialize_message(String(data="interleaved-topic"))
+        )
+        client1.send_message("/empty_ros", b"")
+
+        topic_list_response = json.loads(
+            client1.receive("__topic_list", timeout=5).decode("utf-8")
+        )
+        assert "/to_unity" in topic_list_response["topics"]
+        assert len(topic_list_response["topics"]) == len(topic_list_response["types"])
+        assert from_unity_event.wait(5)
+        assert from_unity_messages[-1] == "interleaved-topic"
+        interleaved_response_header = json.loads(
+            client1.receive("__response", timeout=5).decode("utf-8")
+        )
+        assert interleaved_response_header["srv_id"] == interleaved_service_id
+        interleaved_response = client1.receive("/empty_ros", timeout=5)
+        assert isinstance(
+            deserialize_message(interleaved_response, Empty.Response), Empty.Response
+        )
+
+        first_queued_service_id = 510
+        second_queued_service_id = 511
+        client1.send_command("__request", {"srv_id": first_queued_service_id})
+        client1.send_command("__request", {"srv_id": second_queued_service_id})
+        client1.send_message("/empty_ros", b"")
+        client1.send_message("/empty_ros", b"")
+        queued_response_ids = {
+            json.loads(client1.receive("__response", timeout=5).decode("utf-8"))[
+                "srv_id"
+            ]
+            for _ in range(2)
+        }
+        assert queued_response_ids == {
+            first_queued_service_id,
+            second_queued_service_id,
+        }
+        for _ in range(2):
+            assert isinstance(
+                deserialize_message(
+                    client1.receive("/empty_ros", timeout=5), Empty.Response
+                ),
+                Empty.Response,
+            )
+
         client1.send_command(
             "__ros_service",
             {"topic": "/set_bool_ros", "message_name": "std_srvs/SetBool"},
@@ -657,12 +708,21 @@ def main():
             Empty, "/empty_unity", callback_group=callback_group
         )
         assert unity_service_client.wait_for_service(timeout_sec=5)
-        for response_payload in empty_wire_encodings(Empty.Response()):
+        for response_index, response_payload in enumerate(
+            empty_wire_encodings(Empty.Response())
+        ):
             service_future = unity_service_client.call_async(Empty.Request())
             request_header = json.loads(client1.receive("__request").decode("utf-8"))
             client1.receive("/empty_unity")
             client1.send_command("__response", {"srv_id": request_header["srv_id"]})
+            if response_index == 0:
+                client1.send_command("__topic_list", {})
             client1.send_message("/empty_unity", response_payload)
+            if response_index == 0:
+                interleaved_topic_list = json.loads(
+                    client1.receive("__topic_list", timeout=5).decode("utf-8")
+                )
+                assert "/to_unity" in interleaved_topic_list["topics"]
             assert isinstance(wait_future(service_future), Empty.Response)
 
         original_unity_service_timeout = (
@@ -723,7 +783,12 @@ def main():
         client1.send_command(
             "__action_goal", {"action_name": "/fib_ros", "goal_id": "goal-normal"}
         )
+        client1.send_command("__topic_list", {})
         client1.send_message("/fib_ros", serialize_message(Fibonacci.Goal(order=7)))
+        action_interleaved_topic_list = json.loads(
+            client1.receive("__topic_list", timeout=5).decode("utf-8")
+        )
+        assert "/to_unity" in action_interleaved_topic_list["topics"]
         goal_response = json.loads(
             client1.receive("__action_goal_response", timeout=10).decode("utf-8")
         )

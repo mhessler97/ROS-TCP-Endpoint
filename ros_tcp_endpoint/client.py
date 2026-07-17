@@ -12,12 +12,12 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import struct
-import socket
-import time
-
-import threading
+from collections import deque
 import json
+import socket
+import struct
+import threading
+import time
 
 from rclpy.serialization import serialize_message
 
@@ -27,6 +27,10 @@ class ClientThread(threading.Thread):
     Thread class to read all data from a connection and pass along the data to the
     desired source.
     """
+
+    PAYLOAD_HEADER_COMMANDS = frozenset(
+        ("__request", "__response", "__action_goal", "__action_feedback", "__action_result")
+    )
 
     def __init__(self, conn, tcp_server, incoming_ip, incoming_port, client_id):
         """
@@ -47,6 +51,7 @@ class ClientThread(threading.Thread):
         self.pending_action = None
         self.pending_payload_deadline = None
         self.pending_payload_timeout_sec = 5.0
+        self.deferred_payload_headers = deque()
         threading.Thread.__init__(self)
 
     @staticmethod
@@ -242,6 +247,7 @@ class ClientThread(threading.Thread):
                 "Client {} timed out waiting for pending action payload".format(self.client_id)
             )
         self.clear_pending_payload()
+        self._activate_next_payload_header()
 
     def run(self):
         """
@@ -276,43 +282,7 @@ class ClientThread(threading.Thread):
                 if message is None:
                     break
                 destination, data = message
-
-                # Process this message that was sent from Unity
-                if self.pending_srv_id is not None:
-                    # if we've been told that the next message will be a service request/response, process it as such
-                    if self.pending_srv_is_request:
-                        self.send_ros_service_request(self.pending_srv_id, destination, data)
-                    else:
-                        self.tcp_server.send_unity_service_response(
-                            self.pending_srv_id, data, client_id=self.client_id
-                        )
-                    self.clear_pending_payload()
-                elif self.pending_action is not None:
-                    self._handle_pending_action(destination, data)
-                elif destination == "":
-                    # ignore this keepalive message, listen for more
-                    pass
-                elif destination.startswith("__"):
-                    # handle a system command, such as registering new topics
-                    self.tcp_server.handle_syscommand(destination, data, client_thread=self)
-                else:
-                    ros_communicator = self.tcp_server.get_owned_registration(
-                        self.tcp_server.publishers_table,
-                        self.tcp_server.publisher_clients,
-                        destination,
-                        self.client_id,
-                    )
-                    if ros_communicator is not None:
-                        ros_communicator.send(data)
-                    else:
-                        error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
-                            destination,
-                            self.tcp_server.get_registration_keys(
-                                self.tcp_server.publishers_table
-                            ),
-                        )
-                        self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
-                        self.tcp_server.logerr(error_msg)
+                self.process_frame(destination, data)
         except IOError as e:
             self.tcp_server.logerr("Exception: {}".format(e))
         finally:
@@ -324,6 +294,89 @@ class ClientThread(threading.Thread):
                     self.incoming_ip, self.incoming_port, self.client_id
                 )
             )
+
+    def process_frame(self, destination, data):
+        """Dispatch one complete TCP frame without corrupting pending payload state."""
+        # Keepalives and system commands are self-describing frames. They may be
+        # queued between a service/action header and its payload, so they must
+        # never consume the pending payload slot.
+        if destination == "":
+            return
+        if destination.startswith("__"):
+            if self._has_pending_payload() and destination in self.PAYLOAD_HEADER_COMMANDS:
+                self.deferred_payload_headers.append((destination, data))
+                return
+            self.tcp_server.handle_syscommand(destination, data, client_thread=self)
+            return
+
+        if self.pending_srv_id is not None:
+            expected_table = (
+                self.tcp_server.ros_services_table
+                if self.pending_srv_is_request
+                else self.tcp_server.unity_services_table
+            )
+            expected_owners = (
+                self.tcp_server.ros_service_clients
+                if self.pending_srv_is_request
+                else self.tcp_server.unity_service_clients
+            )
+            is_expected_service = self.tcp_server.get_owned_registration(
+                expected_table, expected_owners, destination, self.client_id
+            ) is not None
+            if not is_expected_service and self._try_publish_frame(destination, data):
+                return
+
+            # If we've been told that the next data frame is a service
+            # request/response, process it as such.
+            pending_srv_id = self.pending_srv_id
+            pending_srv_is_request = self.pending_srv_is_request
+            self.clear_pending_payload()
+            if pending_srv_is_request:
+                self.send_ros_service_request(pending_srv_id, destination, data)
+            else:
+                self.tcp_server.send_unity_service_response(
+                    pending_srv_id, data, client_id=self.client_id
+                )
+            self._activate_next_payload_header()
+            return
+
+        if self.pending_action is not None:
+            expected_action = self.pending_action.get("action_name")
+            if destination != expected_action and self._try_publish_frame(destination, data):
+                return
+            self._handle_pending_action(destination, data)
+            self._activate_next_payload_header()
+            return
+
+        if self._try_publish_frame(destination, data):
+            return
+
+        error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
+            destination,
+            self.tcp_server.get_registration_keys(self.tcp_server.publishers_table),
+        )
+        self.tcp_server.send_unity_error(error_msg, client_id=self.client_id)
+        self.tcp_server.logerr(error_msg)
+
+    def _has_pending_payload(self):
+        return self.pending_srv_id is not None or self.pending_action is not None
+
+    def _activate_next_payload_header(self):
+        while not self._has_pending_payload() and self.deferred_payload_headers:
+            destination, data = self.deferred_payload_headers.popleft()
+            self.tcp_server.handle_syscommand(destination, data, client_thread=self)
+
+    def _try_publish_frame(self, destination, data):
+        ros_communicator = self.tcp_server.get_owned_registration(
+            self.tcp_server.publishers_table,
+            self.tcp_server.publisher_clients,
+            destination,
+            self.client_id,
+        )
+        if ros_communicator is not None:
+            ros_communicator.send(data)
+            return True
+        return False
 
     def _handle_pending_action(self, destination, data):
         action_context = self.pending_action
