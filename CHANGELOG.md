@@ -16,6 +16,10 @@ Added Sonarqube scanner
 
 ### Changed
 
+- Allow independent Unity TCP connections to publish and subscribe to the same
+  ROS topic. Each client now owns its own bridge and QoS settings, so one
+  client's unsubscribe or disconnect does not remove another client's route.
+
 ### Deprecated
 
 ### Removed

@@ -24,7 +24,14 @@ class RosSubscriber(RosReceiver):
     """
 
     def __init__(
-        self, topic, message_class, tcp_server, queue_size=10, latch=False, qos=None
+        self,
+        topic,
+        message_class,
+        tcp_server,
+        queue_size=10,
+        latch=False,
+        qos=None,
+        client_id=None,
     ):
         """
 
@@ -36,12 +43,14 @@ class RosSubscriber(RosReceiver):
             qos:           Optional QoS preset name or policy dictionary
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        self.node_name = f"{strippedTopic}_RosSubscriber"
+        client_suffix = "_{}".format(client_id) if client_id is not None else ""
+        self.node_name = f"{strippedTopic}_RosSubscriber{client_suffix}"
         RosReceiver.__init__(self, self.node_name)
         self.topic = topic
         self.msg = message_class
         self.tcp_server = tcp_server
         self.queue_size = queue_size
+        self.client_id = client_id
 
         self.qos_profile = make_qos_profile(
             queue_size=queue_size, latch=latch, qos=qos
@@ -63,7 +72,9 @@ class RosSubscriber(RosReceiver):
             self.msg: The deserialize message
 
         """
-        self.tcp_server.send_unity_message(self.topic, data)
+        self.tcp_server.send_unity_message(
+            self.topic, data, client_id=self.client_id
+        )
         return self.msg
 
     def unregister(self):

@@ -27,7 +27,15 @@ class RosPublisher(RosSender):
     Class to publish messages to a ROS topic
     """
 
-    def __init__(self, topic, message_class, queue_size=10, latch=False, qos=None):
+    def __init__(
+        self,
+        topic,
+        message_class,
+        queue_size=10,
+        latch=False,
+        qos=None,
+        client_id=None,
+    ):
         """
 
         Args:
@@ -38,7 +46,8 @@ class RosPublisher(RosSender):
             qos:           Optional QoS preset name or policy dictionary
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        node_name = f"{strippedTopic}_RosPublisher"
+        client_suffix = "_{}".format(client_id) if client_id is not None else ""
+        node_name = f"{strippedTopic}_RosPublisher{client_suffix}"
         RosSender.__init__(self, node_name)
         self.msg = message_class()
         self.qos_profile = make_qos_profile(

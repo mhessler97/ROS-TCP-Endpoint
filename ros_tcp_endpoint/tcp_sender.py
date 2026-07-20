@@ -105,23 +105,30 @@ class UnityTcpSender:
             )
 
     def send_unity_message(self, topic, message, client_id=None):
-        target_client_id = self._resolve_owner(
-            self.tcp_server.subscriber_clients, topic, client_id=client_id
-        )
-        if target_client_id is None:
-            self.tcp_server.logwarn(
-                "Dropping message for topic '{}' because no client owns this subscription".format(
-                    topic
+        if client_id is not None:
+            target_client_ids = [client_id]
+        else:
+            with self.tcp_server._state_lock:
+                owners = self.tcp_server.subscriber_clients.get(topic)
+                target_client_ids = (
+                    list(owners) if isinstance(owners, set) else [owners]
                 )
+                target_client_ids = [
+                    owner for owner in target_client_ids if owner is not None
+                ]
+        if not target_client_ids:
+            self.tcp_server.logwarn(
+                "Dropping message for topic '{}' because no client registered "
+                "this subscription".format(topic)
             )
             return
         serialized_message = ClientThread.serialize_message(topic, message)
-        if not self._enqueue(serialized_message, client_id=target_client_id):
-            self.tcp_server.logwarn(
-                "Dropping message for topic '{}' because target client queue is unavailable".format(
-                    topic
+        for target_client_id in target_client_ids:
+            if not self._enqueue(serialized_message, client_id=target_client_id):
+                self.tcp_server.logwarn(
+                    "Dropping message for topic '{}' because client {} queue is "
+                    "unavailable".format(topic, target_client_id)
                 )
-            )
 
     def send_action_feedback(self, topic, goal_id, feedback_msg, client_id=None):
         target_client_id = self._resolve_owner(
@@ -352,9 +359,15 @@ class UnityTcpSender:
     def get_registered_topic(self, topic):
         with self.tcp_server._state_lock:
             if topic in self.tcp_server.publishers_table:
-                return self.tcp_server.publishers_table[topic]
+                registration = self.tcp_server.publishers_table[topic]
+                if isinstance(registration, dict):
+                    return next(iter(registration.values()), None)
+                return registration
             if topic in self.tcp_server.subscribers_table:
-                return self.tcp_server.subscribers_table[topic]
+                registration = self.tcp_server.subscribers_table[topic]
+                if isinstance(registration, dict):
+                    return next(iter(registration.values()), None)
+                return registration
             if topic in self.tcp_server.ros_services_table:
                 return self.tcp_server.ros_services_table[topic]
             if topic in self.tcp_server.unity_services_table:

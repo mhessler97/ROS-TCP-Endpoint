@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import deque
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -575,6 +576,7 @@ def test_subscribe_command_forwards_optional_qos_without_changing_legacy_api(
             "reliability": "best_effort",
             "durability": "transient_local",
         },
+        "client_id": 1,
     }
 
 
@@ -591,34 +593,70 @@ def test_subscribe_command_forwards_legacy_latch_flag(monkeypatch):
     monkeypatch.setattr("ros_tcp_endpoint.server.RosSubscriber", make_subscriber)
     commands.subscribe("/latched", "std_msgs/String", latch=True)
 
-    assert captured == {"queue_size": 10, "latch": True, "qos": None}
+    assert captured == {
+        "queue_size": 10,
+        "latch": True,
+        "qos": None,
+        "client_id": 1,
+    }
 
 
-def test_registration_cannot_replace_or_remove_another_clients_node(monkeypatch):
-    tcp_server = FakeTcpServer(client_id=2)
-    original_node = object()
-    tcp_server.subscribers_table["/shared"] = original_node
-    tcp_server.subscriber_clients["/shared"] = 1
+def test_topic_registration_is_independent_for_multiple_clients(monkeypatch):
+    tcp_server = FakeTcpServer(client_id=1)
     commands = SysCommands(tcp_server)
     commands.resolve_message_name = lambda name, extension_hint=None: object
     monkeypatch.setattr(
         "ros_tcp_endpoint.server.RosSubscriber",
-        lambda topic, message_class, server, **kwargs: object(),
+        lambda topic, message_class, server, **kwargs: SimpleNamespace(
+            created_by=kwargs["client_id"]
+        ),
     )
 
     commands.subscribe("/shared", "std_msgs/String")
+    tcp_server.set_active_client(2)
+    commands.subscribe("/shared", "std_msgs/String")
+
+    assert tcp_server.subscriber_clients["/shared"] == {1, 2}
+    assert set(tcp_server.subscribers_table["/shared"]) == {1, 2}
+    assert tcp_server.subscribers_table["/shared"][1].created_by == 1
+    assert tcp_server.subscribers_table["/shared"][2].created_by == 2
+    assert tcp_server.errors == []
+
     commands.remove_subscriber("/shared")
 
-    assert tcp_server.subscribers_table["/shared"] is original_node
-    assert tcp_server.subscriber_clients["/shared"] == 1
-    assert tcp_server.unregistered == []
-    assert len(tcp_server.errors) == 2
+    assert tcp_server.subscriber_clients["/shared"] == {1}
+    assert set(tcp_server.subscribers_table["/shared"]) == {1}
+    assert tcp_server.unregistered[0].created_by == 2
+    assert tcp_server.errors == []
 
 
 def test_owner_can_replace_and_remove_its_node(monkeypatch):
     tcp_server = FakeTcpServer(client_id=1)
     original_node = object()
     replacement_node = object()
+    tcp_server.subscribers_table["/shared"] = {1: original_node}
+    tcp_server.subscriber_clients["/shared"] = {1}
+    commands = SysCommands(tcp_server)
+    commands.resolve_message_name = lambda name, extension_hint=None: object
+    monkeypatch.setattr(
+        "ros_tcp_endpoint.server.RosSubscriber",
+        lambda topic, message_class, server, **kwargs: replacement_node,
+    )
+
+    commands.subscribe("/shared", "std_msgs/String")
+    assert tcp_server.subscribers_table["/shared"] == {1: replacement_node}
+    assert tcp_server.unregistered == [original_node]
+
+    commands.remove_subscriber("/shared")
+    assert "/shared" not in tcp_server.subscribers_table
+    assert "/shared" not in tcp_server.subscriber_clients
+    assert tcp_server.unregistered == [original_node, replacement_node]
+
+
+def test_shared_topic_registration_upgrades_legacy_single_owner(monkeypatch):
+    tcp_server = FakeTcpServer(client_id=2)
+    original_node = SimpleNamespace(created_by=1)
+    replacement_node = SimpleNamespace(created_by=2)
     tcp_server.subscribers_table["/shared"] = original_node
     tcp_server.subscriber_clients["/shared"] = 1
     commands = SysCommands(tcp_server)
@@ -629,16 +667,17 @@ def test_owner_can_replace_and_remove_its_node(monkeypatch):
     )
 
     commands.subscribe("/shared", "std_msgs/String")
-    assert tcp_server.subscribers_table["/shared"] is replacement_node
-    assert tcp_server.unregistered == [original_node]
 
-    commands.remove_subscriber("/shared")
-    assert "/shared" not in tcp_server.subscribers_table
-    assert "/shared" not in tcp_server.subscriber_clients
-    assert tcp_server.unregistered == [original_node, replacement_node]
+    assert tcp_server.subscriber_clients["/shared"] == {1, 2}
+    assert tcp_server.subscribers_table["/shared"] == {
+        1: original_node,
+        2: replacement_node,
+    }
+    assert tcp_server.unregistered == []
+    assert tcp_server.errors == []
 
 
-def test_concurrent_clients_cannot_both_claim_the_same_registration(monkeypatch):
+def test_concurrent_clients_can_both_claim_the_same_topic(monkeypatch):
     tcp_server = FakeTcpServer(client_id=1)
     start_barrier = threading.Barrier(2)
     commands = SysCommands(tcp_server)
@@ -660,8 +699,24 @@ def test_concurrent_clients_cannot_both_claim_the_same_registration(monkeypatch)
     for thread in threads:
         thread.join(timeout=2.0)
 
-    owner = tcp_server.subscriber_clients["/contended"]
-    assert owner in (1, 2)
-    assert tcp_server.subscribers_table["/contended"].created_by == owner
+    assert tcp_server.subscriber_clients["/contended"] == {1, 2}
+    registrations = tcp_server.subscribers_table["/contended"]
+    assert set(registrations) == {1, 2}
+    assert {node.created_by for node in registrations.values()} == {1, 2}
     assert tcp_server.unregistered == []
-    assert len(tcp_server.errors) == 1
+    assert tcp_server.errors == []
+
+
+def test_shared_subscription_callback_targets_only_its_unity_client():
+    tcp_server = SimpleNamespace(
+        _state_lock=threading.RLock(),
+        subscriber_clients={"/shared": {1, 2}},
+    )
+    sender = UnityTcpSender(tcp_server)
+    sender.client_queues = {1: queue.Queue(), 2: queue.Queue()}
+
+    sender.send_unity_message("/shared", EmptyMessage(), client_id=1)
+
+    assert sender.client_queues[1].get_nowait()
+    with pytest.raises(queue.Empty):
+        sender.client_queues[2].get_nowait()

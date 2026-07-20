@@ -95,6 +95,8 @@ class RawClient:
         self.frames = queue.Queue()
         self.backlog = []
         self.closed = threading.Event()
+        self.read_enabled = threading.Event()
+        self.read_enabled.set()
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
         handshake = self.receive("__handshake", timeout=10)
@@ -106,6 +108,8 @@ class RawClient:
     def _read_loop(self):
         try:
             while not self.closed.is_set():
+                if not self.read_enabled.wait(timeout=0.05):
+                    continue
                 try:
                     destination_size = struct.unpack("<I", recv_exact(self.sock, 4))[0]
                 except socket.timeout:
@@ -158,10 +162,17 @@ class RawClient:
             assert text in payload["text"], payload
         return payload["text"]
 
+    def pause_reads(self):
+        self.read_enabled.clear()
+
+    def resume_reads(self):
+        self.read_enabled.set()
+
     def close(self):
         if self.closed.is_set():
             return
         self.closed.set()
+        self.read_enabled.set()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -198,6 +209,19 @@ def publish_until_received(publisher, client, destination, timeout=5):
         except (TimeoutError, queue.Empty):
             pass
     raise TimeoutError("subscription did not deliver")
+
+
+def receive_string_value(client, destination, expected, timeout=5):
+    """Read topic frames until a specific String value arrives."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = client.receive(destination, timeout=deadline - time.monotonic())
+        message = deserialize_message(payload, String)
+        if message.data == expected:
+            return message
+    raise TimeoutError(
+        "{} did not receive {!r} on {}".format(client.name, expected, destination)
+    )
 
 
 def main():
@@ -323,7 +347,7 @@ def main():
     client1 = RawClient("client1")
     client2 = RawClient("client2")
     try:
-        print("[stress] testing two-client publishing and ownership isolation")
+        print("[stress] testing concurrent clients sharing one publisher topic")
         from_unity_messages = []
         from_unity_event = threading.Event()
 
@@ -335,11 +359,16 @@ def main():
             String,
             "/from_unity",
             on_from_unity,
-            10,
+            100,
             callback_group=callback_group,
         )
         client1.send_command(
-            "__publish", {"topic": "/from_unity", "message_name": "std_msgs/String"}
+            "__publish",
+            {
+                "topic": "/from_unity",
+                "message_name": "std_msgs/String",
+                "queue_size": 100,
+            },
         )
         wait_until(
             lambda: endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 2),
@@ -352,15 +381,49 @@ def main():
         assert from_unity_messages[-1] == "owned-by-client1"
 
         client2.send_command(
-            "__publish", {"topic": "/from_unity", "message_name": "std_msgs/String"}
+            "__publish",
+            {
+                "topic": "/from_unity",
+                "message_name": "std_msgs/String",
+                "queue_size": 100,
+            },
         )
-        client2.expect_error("owned by another client")
-        from_unity_event.clear()
-        client2.send_message(
-            "/from_unity", serialize_message(String(data="unauthorized"))
+        wait_until(
+            lambda: endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 3),
+            message="client2 shared publisher registration",
         )
-        client2.expect_error("Not registered to publish")
-        assert not from_unity_event.wait(0.3)
+        publish_count = 30
+
+        def publish_client_messages(client, prefix):
+            for index in range(publish_count):
+                client.send_message(
+                    "/from_unity",
+                    serialize_message(String(data="{}-{}".format(prefix, index))),
+                )
+
+        first_publisher = threading.Thread(
+            target=publish_client_messages, args=(client1, "client1")
+        )
+        second_publisher = threading.Thread(
+            target=publish_client_messages, args=(client2, "client2")
+        )
+        first_publisher.start()
+        second_publisher.start()
+        first_publisher.join(timeout=10)
+        second_publisher.join(timeout=10)
+        assert not first_publisher.is_alive()
+        assert not second_publisher.is_alive()
+        wait_until(
+            lambda: len(from_unity_messages) >= 1 + (publish_count * 2),
+            timeout=10,
+            message="all messages from both Unity publishers",
+        )
+        expected_values = {
+            "{}-{}".format(prefix, index)
+            for prefix in ("client1", "client2")
+            for index in range(publish_count)
+        }
+        assert expected_values.issubset(set(from_unity_messages))
 
         print("[stress] testing fieldless Unity-to-ROS topic encodings")
         empty_topic_messages = []
@@ -400,7 +463,7 @@ def main():
         assert empty_topic_event.wait(5)
         assert len(empty_topic_messages) == len(empty_topic_encodings) + 1
 
-        print("[stress] testing ROS-to-Unity subscription and collision rejection")
+        print("[stress] testing concurrent clients sharing one subscriber topic")
         to_unity_publisher = ros_node.create_publisher(String, "/to_unity", 10)
         client1.send_command(
             "__subscribe", {"topic": "/to_unity", "message_name": "std_msgs/String"}
@@ -415,9 +478,116 @@ def main():
         client2.send_command(
             "__subscribe", {"topic": "/to_unity", "message_name": "std_msgs/String"}
         )
-        client2.expect_error("owned by another client")
-        delivered = publish_until_received(to_unity_publisher, client1, "/to_unity")
-        assert delivered.data.startswith("ros-message-")
+        wait_until(
+            lambda: endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 3),
+            message="client2 shared subscriber registration",
+        )
+        shared_marker = "shared-subscription-both-clients"
+        to_unity_publisher.publish(String(data=shared_marker))
+        assert receive_string_value(client1, "/to_unity", shared_marker).data == shared_marker
+        assert receive_string_value(client2, "/to_unity", shared_marker).data == shared_marker
+
+        print("[stress] testing one shared client unsubscribe and resubscribe")
+        client2.send_command("__remove_subscriber", {"topic": "/to_unity"})
+        wait_until(
+            lambda: not endpoint.client_owns(
+                endpoint.subscriber_clients, "/to_unity", 3
+            ),
+            message="client2-only subscriber removal",
+        )
+        # Ownership is removed before executor mutation completes. Give the
+        # in-flight unsubscribe command time to finish destroying its ROS
+        # subscription before publishing the negative-control sample.
+        time.sleep(0.2)
+        assert endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 2)
+        client1_only_marker = "client1-remains-after-client2-unsubscribe"
+        to_unity_publisher.publish(String(data=client1_only_marker))
+        assert (
+            receive_string_value(client1, "/to_unity", client1_only_marker).data
+            == client1_only_marker
+        )
+        try:
+            receive_string_value(client2, "/to_unity", client1_only_marker, timeout=0.5)
+            raise AssertionError("unsubscribed client2 still received shared topic")
+        except (TimeoutError, queue.Empty):
+            pass
+        client2.send_command(
+            "__subscribe", {"topic": "/to_unity", "message_name": "std_msgs/String"}
+        )
+        wait_until(
+            lambda: endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 3),
+            message="client2 subscriber re-registration",
+        )
+        resubscribed_marker = "client2-returned-to-shared-subscription"
+        to_unity_publisher.publish(String(data=resubscribed_marker))
+        receive_string_value(client1, "/to_unity", resubscribed_marker)
+        receive_string_value(client2, "/to_unity", resubscribed_marker)
+
+        print("[stress] testing shared client disconnect and reconnect isolation")
+        client2.close()
+        wait_until(
+            lambda: not endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 3),
+            message="client2 publisher disconnect cleanup",
+        )
+        wait_until(
+            lambda: not endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 3),
+            message="client2 subscriber disconnect cleanup",
+        )
+        assert endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 2)
+        assert endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 2)
+        from_unity_event.clear()
+        client1.send_message(
+            "/from_unity", serialize_message(String(data="client1-after-peer-drop"))
+        )
+        assert from_unity_event.wait(5)
+        assert from_unity_messages[-1] == "client1-after-peer-drop"
+        remaining_marker = "client1-subscription-after-peer-drop"
+        to_unity_publisher.publish(String(data=remaining_marker))
+        receive_string_value(client1, "/to_unity", remaining_marker)
+
+        client2 = RawClient("client2-returned")
+        client2.send_command(
+            "__publish", {"topic": "/from_unity", "message_name": "std_msgs/String"}
+        )
+        client2.send_command(
+            "__subscribe", {"topic": "/to_unity", "message_name": "std_msgs/String"}
+        )
+        wait_until(
+            lambda: endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 4),
+            message="returning client2 shared publisher",
+        )
+        wait_until(
+            lambda: endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 4),
+            message="returning client2 shared subscriber",
+        )
+        from_unity_event.clear()
+        client2.send_message(
+            "/from_unity", serialize_message(String(data="client2-after-return"))
+        )
+        assert from_unity_event.wait(5)
+        assert from_unity_messages[-1] == "client2-after-return"
+        returned_marker = "both-subscriptions-after-client2-return"
+        to_unity_publisher.publish(String(data=returned_marker))
+        receive_string_value(client1, "/to_unity", returned_marker)
+        receive_string_value(client2, "/to_unity", returned_marker)
+
+        print("[stress] testing a non-reading client cannot starve its peer")
+        client2.pause_reads()
+        time.sleep(0.1)
+        large_payload = "x" * (128 * 1024)
+        for index in range(64):
+            to_unity_publisher.publish(
+                String(data="slow-peer-{}-{}".format(index, large_payload))
+            )
+        responsive_marker = "responsive-client-survived-slow-peer"
+        to_unity_publisher.publish(String(data=responsive_marker))
+        assert (
+            receive_string_value(
+                client1, "/to_unity", responsive_marker, timeout=15
+            ).data
+            == responsive_marker
+        )
+        client2.resume_reads()
 
         print("[stress] testing backward-compatible topic QoS and late joiners")
         latch_probe_event = threading.Event()
@@ -1172,7 +1342,6 @@ def main():
         wait_until(
             lambda: not any(
                 (
-                    endpoint.get_registration(endpoint.subscriber_clients, "/to_unity"),
                     endpoint.get_registration(endpoint.ros_service_clients, "/empty_ros"),
                     endpoint.get_registration(endpoint.ros_action_clients_owner, "/fib_ros"),
                     endpoint.get_registration(
@@ -1182,20 +1351,24 @@ def main():
             ),
             message="all disconnected client registrations to be removed",
         )
+        assert not endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 2)
+        assert not endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 2)
+        assert endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 4)
+        assert endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 4)
 
         client1 = RawClient("client1-returned")
         client1.send_command(
             "__publish", {"topic": "/from_unity", "message_name": "std_msgs/String"}
         )
         wait_until(
-            lambda: endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 4),
+            lambda: endpoint.client_owns(endpoint.publisher_clients, "/from_unity", 5),
             message="returning client reclaims publisher",
         )
         client1.send_command(
             "__subscribe", {"topic": "/to_unity", "message_name": "std_msgs/String"}
         )
         wait_until(
-            lambda: endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 4),
+            lambda: endpoint.client_owns(endpoint.subscriber_clients, "/to_unity", 5),
             message="returning client reclaims subscriber",
         )
         delivered = publish_until_received(to_unity_publisher, client1, "/to_unity")
@@ -1208,11 +1381,15 @@ def main():
         assert from_unity_messages[-1] == "returned-client"
         client1.close()
         wait_until(
-            lambda: "/from_unity" not in endpoint.publisher_clients,
+            lambda: not endpoint.client_owns(
+                endpoint.publisher_clients, "/from_unity", 5
+            ),
             message="returning client disconnect cleanup",
         )
         wait_until(
-            lambda: "/to_unity" not in endpoint.subscriber_clients,
+            lambda: not endpoint.client_owns(
+                endpoint.subscriber_clients, "/to_unity", 5
+            ),
             message="returning subscriber disconnect cleanup",
         )
 
@@ -1234,7 +1411,7 @@ def main():
             assert from_unity_messages[-1] == "cycle-{}".format(cycle)
             cycling.close()
             wait_until(
-                lambda: "/from_unity" not in endpoint.publisher_clients,
+                lambda: len(endpoint.publisher_clients.get("/from_unity", set())) == 1,
                 message="cycle disconnect cleanup",
             )
 

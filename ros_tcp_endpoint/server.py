@@ -140,7 +140,10 @@ class TcpServer(Node):
 
     def get_registration(self, table, key):
         with self._state_lock:
-            return table.get(key)
+            registration = table.get(key)
+            if isinstance(registration, dict):
+                return next(iter(registration.values()), None)
+            return registration
 
     def get_registration_keys(self, table):
         with self._state_lock:
@@ -148,13 +151,34 @@ class TcpServer(Node):
 
     def get_owned_registration(self, table, owner_table, key, client_id):
         with self._state_lock:
-            if owner_table.get(key) != client_id:
+            owners = owner_table.get(key)
+            if isinstance(owners, set):
+                if client_id not in owners:
+                    return None
+                registrations = table.get(key)
+                if isinstance(registrations, dict):
+                    return registrations.get(client_id)
+                return None
+            if owners != client_id:
                 return None
             return table.get(key)
 
     def client_owns(self, owner_table, key, client_id):
         with self._state_lock:
-            return owner_table.get(key) == client_id
+            owners = owner_table.get(key)
+            if isinstance(owners, set):
+                return client_id in owners
+            return owners == client_id
+
+    @staticmethod
+    def _registration_nodes(table):
+        nodes = []
+        for registration in table.values():
+            if isinstance(registration, dict):
+                nodes.extend(registration.values())
+            else:
+                nodes.append(registration)
+        return nodes
 
     def send_unity_error(self, error, client_id=None):
         if client_id is None:
@@ -268,13 +292,28 @@ class TcpServer(Node):
     def _unregister_owned_nodes(self, client_id, table, owner_table):
         with self._registration_lock:
             with self._state_lock:
-                owned_keys = [key for key, owner in owner_table.items() if owner == client_id]
                 nodes = []
-                for key in owned_keys:
-                    node = table.pop(key, None)
-                    owner_table.pop(key, None)
-                    if node is not None:
-                        nodes.append(node)
+                for key, owners in list(owner_table.items()):
+                    if isinstance(owners, set):
+                        if client_id not in owners:
+                            continue
+                        registrations = table.get(key)
+                        node = (
+                            registrations.pop(client_id, None)
+                            if isinstance(registrations, dict)
+                            else None
+                        )
+                        owners.discard(client_id)
+                        if not owners:
+                            owner_table.pop(key, None)
+                            table.pop(key, None)
+                        if node is not None:
+                            nodes.append(node)
+                    elif owners == client_id:
+                        node = table.pop(key, None)
+                        owner_table.pop(key, None)
+                        if node is not None:
+                            nodes.append(node)
 
             for node in nodes:
                 self.unregister_node(node)
@@ -311,8 +350,8 @@ class TcpServer(Node):
         """
         with self._state_lock:
             registered_nodes = (
-                list(self.publishers_table.values())
-                + list(self.subscribers_table.values())
+                self._registration_nodes(self.publishers_table)
+                + self._registration_nodes(self.subscribers_table)
                 + list(self.ros_services_table.values())
                 + list(self.unity_services_table.values())
                 + list(self.ros_action_clients.values())
@@ -432,8 +471,8 @@ class TcpServer(Node):
         with self._registration_lock:
             with self._state_lock:
                 registered_nodes = (
-                    list(self.publishers_table.values())
-                    + list(self.subscribers_table.values())
+                    self._registration_nodes(self.publishers_table)
+                    + self._registration_nodes(self.subscribers_table)
                     + list(self.ros_services_table.values())
                     + list(self.unity_services_table.values())
                     + list(self.ros_action_clients.values())
@@ -520,6 +559,94 @@ class SysCommands:
                 self.tcp_server.unregister_node(old_node)
         return True
 
+    def _replace_shared_topic_node(
+        self, table, owner_table, key, node_factory, description
+    ):
+        """Create or replace only this client's bridge for a shared ROS topic."""
+        client_id = self._get_active_client_id()
+        if client_id is None:
+            self.tcp_server.logwarn(
+                "Ignoring {} registration without an active client".format(description)
+            )
+            return False
+
+        with self.tcp_server._registration_lock:
+            try:
+                new_node = node_factory(client_id)
+                self.tcp_server.register_node(new_node)
+            except Exception as exc:  # noqa: pylint: disable=broad-except
+                self.tcp_server.logerr(
+                    "Failed to create {} '{}': {}".format(description, key, exc)
+                )
+                self.tcp_server.send_unity_error(
+                    "Failed to register {} '{}': {}".format(description, key, exc),
+                    client_id=client_id,
+                )
+                if "new_node" in locals():
+                    self.tcp_server.unregister_node(new_node)
+                return False
+
+            with self.tcp_server._state_lock:
+                registrations = table.get(key)
+                owners = owner_table.get(key)
+                replaced_unowned_node = None
+                if not isinstance(registrations, dict):
+                    if (
+                        registrations is not None
+                        and owners is not None
+                        and not isinstance(owners, set)
+                    ):
+                        registrations = {owners: registrations}
+                    else:
+                        replaced_unowned_node = registrations
+                        registrations = {}
+                    table[key] = registrations
+                if not isinstance(owners, set):
+                    owners = {owners} if owners is not None else set()
+                    owner_table[key] = owners
+                old_node = registrations.get(client_id) or replaced_unowned_node
+                registrations[client_id] = new_node
+                owners.add(client_id)
+
+            if old_node is not None:
+                self.tcp_server.unregister_node(old_node)
+        return True
+
+    def _remove_shared_topic_node(self, table, owner_table, key, description):
+        """Remove only this client's bridge without disturbing peer clients."""
+        client_id = self._get_active_client_id()
+        with self.tcp_server._registration_lock:
+            with self.tcp_server._state_lock:
+                registrations = table.get(key)
+                owners = owner_table.get(key)
+                if isinstance(registrations, dict) and isinstance(owners, set):
+                    old_node = registrations.get(client_id)
+                    registered_for_client = client_id in owners
+                else:
+                    old_node = registrations if owners == client_id else None
+                    registered_for_client = owners == client_id
+                if old_node is None or not registered_for_client:
+                    error = "{} '{}' is not registered for this client".format(
+                        description, key
+                    )
+                else:
+                    error = None
+                    if isinstance(registrations, dict):
+                        registrations.pop(client_id, None)
+                    if isinstance(owners, set):
+                        owners.discard(client_id)
+                    if not registrations or not isinstance(registrations, dict):
+                        table.pop(key, None)
+                    if not owners or not isinstance(owners, set):
+                        owner_table.pop(key, None)
+
+            if error is not None:
+                self.tcp_server.send_unity_error(error, client_id=client_id)
+                return False
+
+            self.tcp_server.unregister_node(old_node)
+        return True
+
     def _remove_owned_node(self, table, owner_table, key, description):
         client_id = self._get_active_client_id()
         with self.tcp_server._registration_lock:
@@ -575,17 +702,18 @@ class SysCommands:
             )
             return
 
-        if self._replace_owned_node(
+        if self._replace_shared_topic_node(
             self.tcp_server.subscribers_table,
             self.tcp_server.subscriber_clients,
             topic,
-            lambda: RosSubscriber(
+            lambda client_id: RosSubscriber(
                 topic,
                 message_class,
                 self.tcp_server,
                 queue_size=queue_size,
                 latch=latch,
                 qos=qos,
+                client_id=client_id,
             ),
             "subscriber",
         ):
@@ -598,7 +726,7 @@ class SysCommands:
             )
             return
 
-        if self._remove_owned_node(
+        if self._remove_shared_topic_node(
             self.tcp_server.subscribers_table,
             self.tcp_server.subscriber_clients,
             topic,
@@ -622,16 +750,17 @@ class SysCommands:
             )
             return
 
-        if self._replace_owned_node(
+        if self._replace_shared_topic_node(
             self.tcp_server.publishers_table,
             self.tcp_server.publisher_clients,
             topic,
-            lambda: RosPublisher(
+            lambda client_id: RosPublisher(
                 topic,
                 message_class,
                 queue_size=queue_size,
                 latch=latch,
                 qos=qos,
+                client_id=client_id,
             ),
             "publisher",
         ):
