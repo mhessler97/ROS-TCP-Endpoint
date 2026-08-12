@@ -19,6 +19,9 @@ Added Sonarqube scanner
 - Allow independent Unity TCP connections to publish and subscribe to the same
   ROS topic. Each client now owns its own bridge and QoS settings, so one
   client's unsubscribe or disconnect does not remove another client's route.
+- Disable parameter services, type-description services, and rosout on dynamic
+  bridge nodes to reduce executor wait-set and ROS graph overhead. The main
+  endpoint node retains its normal ROS management services.
 
 ### Deprecated
 

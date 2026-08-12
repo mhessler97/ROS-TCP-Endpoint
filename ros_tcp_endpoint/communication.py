@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.serialization import deserialize_message
 
 
@@ -73,14 +74,24 @@ def deserialize_ros_message(data, message_type):
 deserialize_service_message = deserialize_ros_message
 
 
+def bridge_node_options():
+    """Return lean rclpy options for dynamically created bridge nodes."""
+    return {
+        "enable_rosout": False,
+        "start_parameter_services": False,
+        "parameter_overrides": [
+            Parameter("start_type_description_service", value=False)
+        ],
+    }
+
+
 class RosSender(Node):
     """
         Base class for ROS communication where data is sent to the ROS network.
     """
 
     def __init__(self, node_name):
-        super().__init__(node_name)
-        pass
+        super().__init__(node_name, **bridge_node_options())
 
     def send(self, *args):
         raise NotImplementedError
@@ -92,8 +103,7 @@ class RosReceiver(Node):
     """
 
     def __init__(self, node_name):
-        super().__init__(node_name)
-        pass
+        super().__init__(node_name, **bridge_node_options())
 
     def send(self, *args):
         raise NotImplementedError

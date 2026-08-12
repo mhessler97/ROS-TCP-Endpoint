@@ -35,6 +35,8 @@ from std_msgs.msg import Empty as EmptyMessage
 from std_srvs.srv import Empty, SetBool
 
 from ros_tcp_endpoint.communication import (
+    RosReceiver,
+    RosSender,
     deserialize_ros_message,
     deserialize_service_message,
     payload_is_effectively_empty,
@@ -60,6 +62,22 @@ class RecordingLogger:
 
     def info(self, message):
         pass
+
+
+def test_dynamic_bridge_nodes_do_not_create_auxiliary_ros_services():
+    rclpy.init()
+    sender = RosSender("lean_sender_test")
+    receiver = RosReceiver("lean_receiver_test")
+
+    try:
+        assert list(sender.services) == []
+        assert list(receiver.services) == []
+        assert sender.get_parameter("start_type_description_service").value is False
+        assert receiver.get_parameter("start_type_description_service").value is False
+    finally:
+        sender.destroy_node()
+        receiver.destroy_node()
+        rclpy.shutdown()
 
 
 class FakeGoalHandle:
