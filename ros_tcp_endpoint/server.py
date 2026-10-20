@@ -385,7 +385,7 @@ class TcpServer(Node):
                 with self._executor_lock:
                     mutation_requested = self._executor_mutation_requested.is_set()
                     if not mutation_requested:
-                        executor.spin_once(timeout_sec=0.1)
+                        executor.spin_once(timeout_sec=1.0)
                 if mutation_requested:
                     # Let the thread which requested an add/remove operation acquire
                     # the executor lock before starting another spin cycle.
@@ -417,13 +417,14 @@ class TcpServer(Node):
         if executor is None:
             return None
 
-        # rclpy supports wake() from another thread.  Signal before waiting on
-        # _executor_lock so spin_once exits promptly instead of repeatedly
-        # reacquiring the lock and starving registrations/disconnections.
+        # A guard-condition wake alone can rebuild the wait set without returning
+        # from spin_once. Queue a task so even an idle executor releases its lock
+        # promptly, including when both workers are busy. The mutation flag stops
+        # the spin thread from reacquiring the lock before this operation.
         with self._executor_mutation_lock:
             self._executor_mutation_requested.set()
             try:
-                executor.wake()
+                executor.create_task(lambda: None)
                 with self._executor_lock:
                     return operation(executor)
             finally:

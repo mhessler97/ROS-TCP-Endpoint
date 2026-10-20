@@ -41,7 +41,9 @@ class RosActionClient(RosSender):
         self._pending_goals = {}
         self._ros_goal_lookup = {}
         self._lock = threading.Lock()
+        self._unregistered = False
         self._server_health_timer = self.create_timer(0.1, self._check_server_health)
+        self._server_health_timer.cancel()
 
         # Ensure the ROS action server is discoverable before Unity sends goals.
         if not self._client.wait_for_server(timeout_sec=5.0):
@@ -88,6 +90,7 @@ class RosActionClient(RosSender):
             return
         with self._lock:
             self._inflight_goals[goal_uuid] = client_id
+            self._sync_health_timer_locked()
         try:
             goal_future = self._client.send_goal_async(
                 goal_msg,
@@ -96,6 +99,7 @@ class RosActionClient(RosSender):
         except Exception as exc:  # noqa: pylint: disable=broad-except
             with self._lock:
                 self._inflight_goals.pop(goal_uuid, None)
+                self._sync_health_timer_locked()
             message = (
                 f"Failed to send goal {goal_uuid} to '{self.action_name}': {exc}"
             )
@@ -135,6 +139,12 @@ class RosActionClient(RosSender):
 
     def unregister(self):
         """Tear down the underlying rclpy node."""
+        with self._lock:
+            self._unregistered = True
+            self._server_health_timer.cancel()
+            self._inflight_goals.clear()
+            self._pending_goals.clear()
+            self._ros_goal_lookup.clear()
         self._client.destroy()
         self.destroy_node()
 
@@ -164,6 +174,7 @@ class RosActionClient(RosSender):
                 if unity_goal_id not in self._inflight_goals:
                     return
                 self._inflight_goals.pop(unity_goal_id)
+                self._sync_health_timer_locked()
             self.tcp_server.unity_tcp_sender.send_action_goal_response(
                 self.action_name,
                 unity_goal_id,
@@ -182,6 +193,7 @@ class RosActionClient(RosSender):
                 if unity_goal_id not in self._inflight_goals:
                     return
                 self._inflight_goals.pop(unity_goal_id)
+                self._sync_health_timer_locked()
             self.tcp_server.unity_tcp_sender.send_action_goal_response(
                 self.action_name,
                 unity_goal_id,
@@ -296,17 +308,33 @@ class RosActionClient(RosSender):
                 ros_goal_id = goal_meta.get("ros_goal_id")
                 if ros_goal_id in self._ros_goal_lookup:
                     del self._ros_goal_lookup[ros_goal_id]
+            self._sync_health_timer_locked()
             return goal_meta
+
+    def _sync_health_timer_locked(self):
+        """Monitor server loss only while goals need a response; caller holds _lock."""
+        if self._unregistered:
+            return
+        if self._inflight_goals or self._pending_goals:
+            if self._server_health_timer.is_canceled():
+                self._server_health_timer.reset()
+                executor = self.executor
+                if executor is not None:
+                    executor.wake()
+        elif not self._server_health_timer.is_canceled():
+            self._server_health_timer.cancel()
 
     def _check_server_health(self):
         """Finish TCP-side requests if a ROS action server disappears."""
-        if self._client.server_is_ready():
-            return
-
         with self._lock:
+            if self._unregistered or not (self._inflight_goals or self._pending_goals):
+                return
+            if self._client.server_is_ready():
+                return
             inflight_goals = list(self._inflight_goals.items())
             self._inflight_goals.clear()
             pending_goal_ids = list(self._pending_goals.keys())
+            self._sync_health_timer_locked()
 
         for goal_id, client_id in inflight_goals:
             message = (

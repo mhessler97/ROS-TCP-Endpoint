@@ -14,8 +14,11 @@
 
 import re
 
+from rclpy.utilities import get_rmw_implementation_identifier
+
 from .communication import RosReceiver
 from .qos import make_qos_profile
+from .subscription_callback_group import SubscriptionCallbackGroup
 
 
 class RosSubscriber(RosReceiver):
@@ -56,9 +59,16 @@ class RosSubscriber(RosReceiver):
             queue_size=queue_size, latch=latch, qos=qos
         )
 
+        callback_group = None
+        if get_rmw_implementation_identifier() in (
+            "rmw_fastrtps_cpp", "rmw_fastrtps_dynamic_cpp"
+        ):
+            callback_group = SubscriptionCallbackGroup()
+
         # Start Subscriber listener function
         self.subscription = self.create_subscription(
-            self.msg, self.topic, self.send, self.qos_profile
+            self.msg, self.topic, self.send, self.qos_profile,
+            callback_group=callback_group,
         )
         self.subscription
 
